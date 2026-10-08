@@ -8,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 # Default environment selector. It can be overridden with LIVE=true in .env.
-LIVE = true
+LIVE = True
 LOCAL_FRONTEND_URL = "http://localhost:4200"
 PRODUCTION_FRONTEND_URL = "https://powerleadresponse.netlify.app"
 
