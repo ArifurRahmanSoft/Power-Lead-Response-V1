@@ -24,7 +24,7 @@ Restart Uvicorn after changing the selected environment.
 The same selector controls the only allowed browser origin:
 
 - `LIVE=false`: `http://localhost:4200`
-- `LIVE=true`: `https://projectname.netlify.app`
+- `LIVE=true`: `https://powerleadresponse.netlify.app`
 
 Both frontend URLs are maintained in `app/core/config.py`.
 
