@@ -32,6 +32,8 @@ class PermissionKey(StrEnum):
     LEADS_IMPORT = "leads.import"
     LEADS_ASSIGN = "leads.assign"
     LEADS_STATUS = "leads.status"
+    CUSTOMERS_VIEW = "customers.view"
+    CUSTOMERS_CONVERT = "customers.convert"
     WORKFLOWS_VIEW = "workflows.view"
     WORKFLOWS_CREATE = "workflows.create"
     WORKFLOWS_UPDATE = "workflows.update"
@@ -60,6 +62,16 @@ class PermissionKey(StrEnum):
     SETTINGS_MENU_PERMISSIONS_UPDATE = "settings.menu_permissions.update"
     SETTINGS_INTEGRATIONS_VIEW = "settings.integrations.view"
     SETTINGS_INTEGRATIONS_UPDATE = "settings.integrations.update"
+    MAIL_VIEW = "mail.view"
+    MAIL_MANAGE = "mail.manage"
+    MAIL_TEST = "mail.test"
+    MAIL_SEND = "mail.send"
+    MAIL_CANCEL = "mail.cancel"
+    MAIL_TEMPLATES_VIEW = "mail.templates.view"
+    MAIL_TEMPLATES_MANAGE = "mail.templates.manage"
+    MAIL_TEMPLATES_APPROVE = "mail.templates.approve"
+    MESSAGES_VIEW = "messages.view"
+    MESSAGES_SEND = "messages.send"
 
 
 ROLE_PERMISSIONS: dict[RoleKey, frozenset[PermissionKey]] = {
@@ -84,6 +96,8 @@ ROLE_PERMISSIONS: dict[RoleKey, frozenset[PermissionKey]] = {
             PermissionKey.LEADS_IMPORT,
             PermissionKey.LEADS_ASSIGN,
             PermissionKey.LEADS_STATUS,
+            PermissionKey.CUSTOMERS_VIEW,
+            PermissionKey.CUSTOMERS_CONVERT,
             PermissionKey.WORKFLOWS_VIEW,
             PermissionKey.WORKFLOWS_CREATE,
             PermissionKey.WORKFLOWS_UPDATE,
@@ -98,6 +112,9 @@ ROLE_PERMISSIONS: dict[RoleKey, frozenset[PermissionKey]] = {
             PermissionKey.TEMPLATES_CREATE,
             PermissionKey.TEMPLATES_UPDATE,
             PermissionKey.TEMPLATES_DELETE,
+            PermissionKey.MAIL_VIEW,
+            PermissionKey.MAIL_SEND,
+            PermissionKey.MAIL_CANCEL,
         }
     ),
     RoleKey.STAFF: frozenset(
@@ -110,8 +127,10 @@ ROLE_PERMISSIONS: dict[RoleKey, frozenset[PermissionKey]] = {
             PermissionKey.OVERVIEW_VIEW,
             PermissionKey.LEADS_VIEW,
             PermissionKey.LEADS_UPDATE,
+            PermissionKey.CUSTOMERS_VIEW,
             PermissionKey.WORKFLOWS_VIEW,
             PermissionKey.TEMPLATES_VIEW,
+            PermissionKey.MAIL_VIEW,
         }
     ),
     RoleKey.READONLY: frozenset(
@@ -123,6 +142,7 @@ ROLE_PERMISSIONS: dict[RoleKey, frozenset[PermissionKey]] = {
             PermissionKey.DASHBOARD_READ,
             PermissionKey.OVERVIEW_VIEW,
             PermissionKey.LEADS_VIEW,
+            PermissionKey.CUSTOMERS_VIEW,
             PermissionKey.WORKFLOWS_VIEW,
             PermissionKey.AUDITS_VIEW,
             PermissionKey.TEMPLATES_VIEW,

@@ -15,6 +15,7 @@ MENU_CATALOG: tuple[MenuDefinition, ...] = (
         "Leads",
         ("view", "create", "update", "delete", "export", "import", "assign", "status"),
     ),
+    MenuDefinition("customers", "Customers", ("view", "convert")),
     MenuDefinition(
         "workflows",
         "Workflows",
@@ -26,6 +27,9 @@ MENU_CATALOG: tuple[MenuDefinition, ...] = (
         "Templates",
         ("view", "create", "update", "delete", "approve"),
     ),
+    MenuDefinition("mail", "Mail", ("view", "manage", "test", "send", "cancel")),
+    MenuDefinition("mail.templates", "Mail Templates", ("view", "manage", "approve")),
+    MenuDefinition("messages", "Messages", ("view", "send")),
     MenuDefinition(
         "settings.roles",
         "Role Setup",

@@ -45,6 +45,13 @@ class LeadSource(StrEnum):
     IMPORT = "import"
 
 
+class LeadPriority(StrEnum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    URGENT = "urgent"
+
+
 class ConsentStatus(StrEnum):
     UNKNOWN = "unknown"
     NOT_REQUESTED = "not_requested"

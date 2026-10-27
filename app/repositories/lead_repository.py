@@ -15,6 +15,8 @@ from app.models.lead import (
 )
 from app.models.membership import TenantMembership
 from app.models.user import User
+from app.models.outbound_message import OutboundMessage
+from app.models.sms_message import SmsMessage
 from app.schemas.lead import LeadFilterParams
 from app.utils.lead_normalization import country_name_to_code
 
@@ -82,6 +84,153 @@ def get_lead(
     return database_session.scalar(statement)
 
 
+def lead_filter_conditions(
+    *,
+    tenant_id: uuid.UUID,
+    filters: LeadFilterParams,
+    assigned_scope_user_id: uuid.UUID | None,
+) -> list[Any]:
+    conditions: list[Any] = [Lead.tenant_id == tenant_id, Lead.deleted_at.is_(None)]
+    if assigned_scope_user_id is not None:
+        conditions.append(Lead.assigned_user_id == assigned_scope_user_id)
+    if filters.search:
+        term = f"%{filters.search.strip()}%"
+        conditions.append(or_(Lead.first_name.ilike(term), Lead.last_name.ilike(term), Lead.email.ilike(term), Lead.company.ilike(term)))
+    for field in ("email", "company", "industry"):
+        value = getattr(filters, field)
+        if value:
+            conditions.append(getattr(Lead, field).ilike(f"%{value.strip()}%"))
+    if filters.service_requested:
+        conditions.append(func.lower(func.trim(Lead.service_requested)) == filters.service_requested.lower())
+    if filters.country:
+        conditions.append(Lead.country == country_name_to_code(filters.country))
+    if filters.name:
+        term = f"%{filters.name.strip()}%"
+        conditions.append(or_(Lead.first_name.ilike(term), Lead.last_name.ilike(term)))
+    for field in ("status", "email_status", "source", "priority"):
+        value = getattr(filters, field)
+        if value is not None:
+            conditions.append(getattr(Lead, field) == str(value))
+    if filters.assigned_user_id is not None:
+        conditions.append(Lead.assigned_user_id == filters.assigned_user_id)
+    latest_state = select(OutboundMessage.status).where(
+        OutboundMessage.tenant_id == tenant_id,
+        OutboundMessage.lead_id == Lead.id,
+    ).order_by(OutboundMessage.created_at.desc(), OutboundMessage.id.desc()).limit(1).correlate(Lead).scalar_subquery()
+    latest_stage = select(OutboundMessage.contact_stage).where(
+        OutboundMessage.tenant_id == tenant_id,
+        OutboundMessage.lead_id == Lead.id,
+    ).order_by(OutboundMessage.created_at.desc(), OutboundMessage.id.desc()).limit(1).correlate(Lead).scalar_subquery()
+    if filters.email_state:
+        conditions.append(func.coalesce(latest_state, "not_contacted_by_email") == filters.email_state)
+    if filters.email_stage:
+        conditions.append(latest_stage == filters.email_stage)
+    return conditions
+
+
+def list_authorized_lead_ids(
+    database_session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    filters: LeadFilterParams,
+    assigned_scope_user_id: uuid.UUID | None,
+    limit: int,
+) -> tuple[list[uuid.UUID], int]:
+    conditions = lead_filter_conditions(
+        tenant_id=tenant_id,
+        filters=filters,
+        assigned_scope_user_id=assigned_scope_user_id,
+    )
+    total = database_session.scalar(select(func.count(Lead.id)).where(*conditions)) or 0
+    ids = list(database_session.scalars(
+        select(Lead.id).where(*conditions).order_by(Lead.created_at.desc(), Lead.id).limit(limit)
+    ).all())
+    return ids, total
+
+
+def attach_email_summaries(database_session: Session, leads: list[Lead]) -> None:
+    if not leads:
+        return
+    lead_ids = [lead.id for lead in leads]
+    ranked = select(
+        OutboundMessage.lead_id.label("lead_id"),
+        OutboundMessage.status.label("state"),
+        OutboundMessage.contact_stage.label("stage"),
+        OutboundMessage.provider_attempt_started_at.label("attempted_at"),
+        OutboundMessage.sent_at.label("sent_at"),
+        func.row_number().over(
+            partition_by=OutboundMessage.lead_id,
+            order_by=(OutboundMessage.created_at.desc(), OutboundMessage.id.desc()),
+        ).label("position"),
+    ).where(OutboundMessage.lead_id.in_(lead_ids)).subquery()
+    aggregates = select(
+        OutboundMessage.lead_id.label("lead_id"),
+        func.count(OutboundMessage.id).label("attempt_count"),
+        func.max(OutboundMessage.sent_at).label("last_successful_email_at"),
+    ).where(OutboundMessage.lead_id.in_(lead_ids)).group_by(OutboundMessage.lead_id).subquery()
+    rows = database_session.execute(
+        select(ranked, aggregates.c.attempt_count, aggregates.c.last_successful_email_at)
+        .join(aggregates, aggregates.c.lead_id == ranked.c.lead_id)
+        .where(ranked.c.position == 1)
+    ).mappings().all()
+    by_lead = {row["lead_id"]: dict(row) for row in rows}
+    for lead in leads:
+        summary = by_lead.get(lead.id)
+        lead.email_summary = ({
+            "state": summary["state"],
+            "stage": summary["stage"],
+            "attempted_at": summary["attempted_at"],
+            "sent_at": summary["sent_at"],
+            "last_successful_email_at": summary["last_successful_email_at"],
+            "attempt_count": summary["attempt_count"],
+        } if summary else {"state": "not_contacted_by_email", "stage": None, "attempt_count": 0})
+
+
+def attach_sms_summaries(database_session: Session, leads: list[Lead]) -> None:
+    if not leads:
+        return
+    lead_ids = [lead.id for lead in leads]
+    ranked = select(
+        SmsMessage.lead_id.label("lead_id"),
+        SmsMessage.status.label("provider_status"),
+        SmsMessage.contact_type.label("contact_type"),
+        func.row_number().over(
+            partition_by=SmsMessage.lead_id,
+            order_by=(SmsMessage.created_at.desc(), SmsMessage.id.desc()),
+        ).label("position"),
+    ).where(SmsMessage.lead_id.in_(lead_ids)).subquery()
+    successful = select(
+        SmsMessage.lead_id.label("lead_id"),
+        func.max(func.coalesce(SmsMessage.delivered_at, SmsMessage.sent_at)).label(
+            "last_successful_at"
+        ),
+    ).where(
+        SmsMessage.lead_id.in_(lead_ids),
+        SmsMessage.status.in_(("sent", "delivered")),
+    ).group_by(SmsMessage.lead_id).subquery()
+    rows = database_session.execute(
+        select(ranked, successful.c.last_successful_at)
+        .outerjoin(successful, successful.c.lead_id == ranked.c.lead_id)
+        .where(ranked.c.position == 1)
+    ).mappings().all()
+    by_lead = {row["lead_id"]: dict(row) for row in rows}
+    for lead in leads:
+        summary = by_lead.get(lead.id)
+        lead.sms_summary = (
+            {
+                "contact_type": summary["contact_type"],
+                "provider_status": summary["provider_status"],
+                "last_successful_at": summary["last_successful_at"],
+            }
+            if summary
+            else {
+                "contact_type": None,
+                "provider_status": "not_contacted_by_sms",
+                "last_successful_at": None,
+            }
+        )
+
+
 def list_leads(
     database_session: Session,
     *,
@@ -91,39 +240,11 @@ def list_leads(
     filters: LeadFilterParams,
     assigned_scope_user_id: uuid.UUID | None,
 ) -> Page:
-    conditions = [Lead.tenant_id == tenant_id, Lead.deleted_at.is_(None)]
-    if assigned_scope_user_id is not None:
-        conditions.append(Lead.assigned_user_id == assigned_scope_user_id)
-    if filters.search:
-        term = f"%{filters.search.strip()}%"
-        conditions.append(
-            or_(
-                Lead.first_name.ilike(term),
-                Lead.last_name.ilike(term),
-                Lead.email.ilike(term),
-                Lead.company.ilike(term),
-            )
-        )
-    for field in ("email", "company", "industry"):
-        value = getattr(filters, field)
-        if value:
-            conditions.append(getattr(Lead, field).ilike(f"%{value.strip()}%"))
-    if filters.service_requested:
-        conditions.append(
-            func.lower(func.trim(Lead.service_requested))
-            == filters.service_requested.lower()
-        )
-    if filters.country:
-        conditions.append(Lead.country == country_name_to_code(filters.country))
-    if filters.name:
-        term = f"%{filters.name.strip()}%"
-        conditions.append(or_(Lead.first_name.ilike(term), Lead.last_name.ilike(term)))
-    for field in ("status", "email_status", "source"):
-        value = getattr(filters, field)
-        if value is not None:
-            conditions.append(getattr(Lead, field) == str(value))
-    if filters.assigned_user_id is not None:
-        conditions.append(Lead.assigned_user_id == filters.assigned_user_id)
+    conditions = lead_filter_conditions(
+        tenant_id=tenant_id,
+        filters=filters,
+        assigned_scope_user_id=assigned_scope_user_id,
+    )
 
     total = database_session.scalar(select(func.count(Lead.id)).where(*conditions)) or 0
     items = list(
@@ -135,6 +256,8 @@ def list_leads(
             .limit(size)
         ).all()
     )
+    attach_email_summaries(database_session, items)
+    attach_sms_summaries(database_session, items)
     return Page(items=items, total=total)
 
 
@@ -250,6 +373,9 @@ def cancel_pending_customer_actions(
     database_session: Session,
     lead_id: uuid.UUID,
     cancelled_at: datetime,
+    *,
+    cancelled_by: uuid.UUID | None = None,
+    cancellation_reason: str | None = None,
 ) -> int:
     result = database_session.execute(
         update(LeadCustomerAction)
@@ -257,7 +383,12 @@ def cancel_pending_customer_actions(
             LeadCustomerAction.lead_id == lead_id,
             LeadCustomerAction.status == "pending",
         )
-        .values(status="cancelled", cancelled_at=cancelled_at)
+        .values(
+            status="cancelled",
+            cancelled_at=cancelled_at,
+            cancelled_by=cancelled_by,
+            cancellation_reason=cancellation_reason,
+        )
     )
     return int(result.rowcount or 0)
 

@@ -31,3 +31,8 @@ class SlidingWindowRateLimiter:
 
 
 lead_voice_rate_limiter = SlidingWindowRateLimiter()
+smtp_test_email_rate_limiter = SlidingWindowRateLimiter()
+whatsapp_reply_rate_limiter = SlidingWindowRateLimiter()
+meta_whatsapp_send_rate_limiter = SlidingWindowRateLimiter()
+meta_messenger_reply_rate_limiter = SlidingWindowRateLimiter()
+meta_messenger_profile_refresh_rate_limiter = SlidingWindowRateLimiter()

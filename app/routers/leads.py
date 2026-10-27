@@ -43,6 +43,27 @@ from app.schemas.lead import (
     LeadUpdateRequest,
 )
 from app.schemas.lead_voice import LeadVoiceExtractResponse
+from app.schemas.lead_assignment import (
+    LeadAssignmentHistoryData,
+    LeadAssignmentHistoryListData,
+    LeadAssignmentHistoryListResponse,
+)
+from app.schemas.lead_activity import (
+    LeadActivityAmendRequest,
+    LeadActivityData,
+    LeadActivityCreateRequest,
+    LeadActivityListData,
+    LeadActivityListResponse,
+    LeadActivityResponse,
+)
+from app.services.lead_activity_service import (
+    LeadActivityNotFoundError,
+    LeadActivityReferenceError,
+    LeadActivityValidationError,
+    amend_manual_lead_activity,
+    create_manual_lead_activity,
+    get_lead_activity_timeline,
+)
 from app.services.lead_import_service import (
     LeadImportExpiredError,
     LeadImportNotFoundError,
@@ -62,8 +83,10 @@ from app.services.lead_voice_service import (
 )
 from app.services.lead_service import (
     LeadAssignmentError,
+    LeadAssignmentDispositionError,
     LeadConflictError,
     LeadDuplicateError,
+    LeadExplicitConversionRequiredError,
     LeadNotFoundError,
     LeadPermissionError,
     LeadScopeError,
@@ -71,6 +94,7 @@ from app.services.lead_service import (
     archive_lead,
     create_lead,
     get_lead_for_context,
+    get_lead_assignment_history,
     get_leads,
     get_service_filter_options,
     update_lead,
@@ -123,11 +147,28 @@ def _raise_lead_error(exception: Exception) -> None:
         raise HTTPException(status_code=409, detail="Lead was modified by another request") from exception
     if isinstance(exception, LeadAssignmentError):
         raise HTTPException(status_code=400, detail="Assignee must be an active member of this workspace") from exception
+    if isinstance(exception, LeadAssignmentDispositionError):
+        raise HTTPException(status_code=400, detail=str(exception)) from exception
     if isinstance(exception, LeadTransitionError):
         raise HTTPException(status_code=400, detail="Invalid lead state or field combination") from exception
+    if isinstance(exception, LeadExplicitConversionRequiredError):
+        raise HTTPException(
+            status_code=400,
+            detail="Use the explicit lead conversion endpoint",
+        ) from exception
     if isinstance(exception, (LeadScopeError, LeadPermissionError)):
         raise HTTPException(status_code=403, detail="Lead operation is not authorized") from exception
     raise exception
+
+
+def _raise_activity_error(exception: Exception) -> None:
+    if isinstance(exception, LeadActivityNotFoundError):
+        raise HTTPException(status_code=404, detail="Lead activity not found") from exception
+    if isinstance(exception, LeadActivityReferenceError):
+        raise HTTPException(status_code=400, detail=str(exception)) from exception
+    if isinstance(exception, LeadActivityValidationError):
+        raise HTTPException(status_code=422, detail="Invalid amended activity data") from exception
+    _raise_lead_error(exception)
 
 
 @router.get("/import-template")
@@ -251,6 +292,144 @@ def create_lead_route(
     return LeadResponse(success=True, message="Lead created", data=_lead_data(lead))
 
 
+@router.get(
+    "/{lead_id}/activities",
+    response_model=LeadActivityListResponse,
+)
+def list_lead_activities_route(
+    lead_id: uuid.UUID,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.LEADS_VIEW)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> LeadActivityListResponse:
+    try:
+        result = get_lead_activity_timeline(
+            database_session,
+            context,
+            lead_id,
+            page=page,
+            size=size,
+        )
+    except Exception as exception:
+        _raise_activity_error(exception)
+        raise
+    return LeadActivityListResponse(
+        success=True,
+        data=LeadActivityListData(
+            items=[LeadActivityData.model_validate(item) for item in result.items],
+            page=page,
+            size=size,
+            total=result.total,
+        ),
+    )
+
+
+@router.get(
+    "/{lead_id}/assignment-history",
+    response_model=LeadAssignmentHistoryListResponse,
+)
+def list_lead_assignment_history_route(
+    lead_id: uuid.UUID,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.LEADS_VIEW)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    size: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> LeadAssignmentHistoryListResponse:
+    try:
+        result = get_lead_assignment_history(
+            database_session,
+            context,
+            lead_id,
+            page=page,
+            size=size,
+        )
+    except Exception as exception:
+        _raise_lead_error(exception)
+        raise
+    return LeadAssignmentHistoryListResponse(
+        success=True,
+        data=LeadAssignmentHistoryListData(
+            items=[
+                LeadAssignmentHistoryData.model_validate(item) for item in result.items
+            ],
+            page=page,
+            size=size,
+            total=result.total,
+        ),
+    )
+
+
+@router.post(
+    "/{lead_id}/activities",
+    response_model=LeadActivityResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_lead_activity_route(
+    lead_id: uuid.UUID,
+    payload: LeadActivityCreateRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.LEADS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> LeadActivityResponse:
+    try:
+        activity = create_manual_lead_activity(
+            database_session,
+            context,
+            lead_id,
+            payload,
+        )
+    except Exception as exception:
+        _raise_activity_error(exception)
+        raise
+    return LeadActivityResponse(
+        success=True,
+        message="Lead activity recorded",
+        data=LeadActivityData.model_validate(activity),
+    )
+
+
+@router.post(
+    "/{lead_id}/activities/{activity_id}/amendments",
+    response_model=LeadActivityResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def amend_lead_activity_route(
+    lead_id: uuid.UUID,
+    activity_id: uuid.UUID,
+    payload: LeadActivityAmendRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.LEADS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> LeadActivityResponse:
+    try:
+        amendment = amend_manual_lead_activity(
+            database_session,
+            context,
+            lead_id,
+            activity_id,
+            payload,
+        )
+    except Exception as exception:
+        _raise_activity_error(exception)
+        raise
+    return LeadActivityResponse(
+        success=True,
+        message="Lead activity amendment recorded",
+        data=LeadActivityData.model_validate(amendment),
+    )
+
+
 @router.get("", response_model=LeadListResponse)
 def list_leads_route(
     context: Annotated[
@@ -271,6 +450,9 @@ def list_leads_route(
     email_status: str | None = None,
     source: str | None = None,
     assigned_user_id: uuid.UUID | None = None,
+    priority: str | None = None,
+    email_state: str | None = None,
+    email_stage: str | None = None,
 ) -> LeadListResponse:
     try:
         filters = LeadFilterParams(
@@ -285,6 +467,9 @@ def list_leads_route(
             email_status=email_status,
             source=source,
             assigned_user_id=assigned_user_id,
+            priority=priority,
+            email_state=email_state,
+            email_stage=email_stage,
         )
         result = get_leads(database_session, context, page=page, size=size, filters=filters)
     except ValueError as exception:

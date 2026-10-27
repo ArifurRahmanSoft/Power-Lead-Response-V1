@@ -15,6 +15,7 @@ from app.core.lead_catalogs import (
     CompanySize,
     ConsentStatus,
     EmailStatus,
+    LeadPriority,
     RevenuePeriod,
 )
 from app.schemas.lead import LeadFields, validation_errors
@@ -47,6 +48,7 @@ CANONICAL_COLUMNS = (
     "consent_status",
     "consent_evidence",
     "consent_reference",
+    "priority",
 )
 REQUIRED_COLUMNS = frozenset({"first_name", "last_name", "email"})
 TEXT_ONLY_COLUMNS = frozenset({"phone"})
@@ -136,6 +138,7 @@ def build_import_template() -> bytes:
         "revenue_currency": "USD",
         "revenue_period": "annual",
         "consent_status": "unknown",
+        "priority": "normal",
     }
     for column, field in enumerate(CANONICAL_COLUMNS, start=1):
         sample.cell(2, column, _safe_cell(sample_values.get(field, "")))
@@ -145,6 +148,7 @@ def build_import_template() -> bytes:
         "company_size": [item.value for item in CompanySize],
         "revenue_period": [item.value for item in RevenuePeriod],
         "consent_status": [item.value for item in ConsentStatus],
+        "priority": [item.value for item in LeadPriority],
         "country": country_catalog_names(),
         "revenue_currency": sorted(CURRENCY_CODES),
     }

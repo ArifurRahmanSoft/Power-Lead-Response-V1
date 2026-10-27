@@ -19,6 +19,7 @@ from app.core.lead_catalogs import (
     EmailStatus,
     LeadSource,
     LeadStatus,
+    LeadPriority,
     RevenuePeriod,
 )
 from app.utils.lead_normalization import normalize_country_name, normalize_optional_url
@@ -74,6 +75,7 @@ class LeadFields(BaseModel):
     consent_status: ConsentStatus = ConsentStatus.UNKNOWN
     consent_evidence: str | None = Field(default=None, max_length=4000)
     consent_reference: str | None = Field(default=None, max_length=255)
+    priority: LeadPriority = LeadPriority.NORMAL
 
     @field_validator("first_name", "last_name")
     @classmethod
@@ -169,6 +171,9 @@ class LeadUpdateRequest(BaseModel):
     consent_status: ConsentStatus | None = None
     consent_evidence: str | None = Field(default=None, max_length=4000)
     consent_reference: str | None = Field(default=None, max_length=255)
+    priority: LeadPriority | None = None
+    assignment_reason: str | None = Field(default=None, max_length=1000)
+    pending_task_disposition: str | None = None
 
     @field_validator("first_name", "last_name")
     @classmethod
@@ -191,6 +196,23 @@ class LeadUpdateRequest(BaseModel):
         if not isinstance(value, str):
             return value
         return value.strip() or None
+
+    @field_validator("assignment_reason", mode="before")
+    @classmethod
+    def clean_assignment_reason(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        return " ".join(value.strip().split()) or None
+
+    @field_validator("pending_task_disposition")
+    @classmethod
+    def validate_task_disposition(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in {"transfer", "retain", "cancel"}:
+            raise ValueError("pending_task_disposition must be transfer, retain, or cancel")
+        return normalized
 
     @field_validator(*URL_FIELDS, mode="before")
     @classmethod
@@ -217,6 +239,21 @@ class LeadUpdateRequest(BaseModel):
         if not (self.model_fields_set - {"row_version"}):
             raise ValueError("Provide at least one field to update")
         return self
+
+
+class LeadEmailSummary(BaseModel):
+    state: str
+    stage: str | None = None
+    attempted_at: datetime | None = None
+    sent_at: datetime | None = None
+    last_successful_email_at: datetime | None = None
+    attempt_count: int = 0
+
+
+class LeadSmsSummary(BaseModel):
+    contact_type: str | None = None
+    provider_status: str = "not_contacted_by_sms"
+    last_successful_at: datetime | None = None
 
 
 class LeadData(BaseModel):
@@ -249,6 +286,7 @@ class LeadData(BaseModel):
     notes: str | None
     source: LeadSource
     status: LeadStatus
+    priority: LeadPriority
     assigned_user_id: uuid.UUID | None
     consent_status: ConsentStatus
     consent_evidence: str | None
@@ -259,6 +297,10 @@ class LeadData(BaseModel):
     updated_at: datetime
     updated_by: uuid.UUID
     row_version: int
+    email_summary: LeadEmailSummary = Field(
+        default_factory=lambda: LeadEmailSummary(state="not_contacted_by_email", attempt_count=0)
+    )
+    sms_summary: LeadSmsSummary = Field(default_factory=LeadSmsSummary)
 
     @field_validator("country", mode="before")
     @classmethod
@@ -348,6 +390,8 @@ class LeadImportErrorsResponse(BaseModel):
 
 
 class LeadFilterParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     search: str | None = None
     name: str | None = None
     email: str | None = None
@@ -359,6 +403,15 @@ class LeadFilterParams(BaseModel):
     email_status: EmailStatus | None = None
     source: LeadSource | None = None
     assigned_user_id: uuid.UUID | None = None
+    priority: LeadPriority | None = None
+    email_state: str | None = Field(
+        default=None,
+        pattern="^(not_contacted_by_email|queued|processing|sent|failed|unknown|cancelled|skipped)$",
+    )
+    email_stage: str | None = Field(
+        default=None,
+        pattern="^(initial|follow_up|second_follow_up|final_follow_up)$",
+    )
 
     @field_validator("country", mode="before")
     @classmethod

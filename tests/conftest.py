@@ -1,9 +1,15 @@
 from collections.abc import Generator
 import os
 
+from cryptography.fernet import Fernet
+
 os.environ.setdefault(
     "JWT_SECRET_KEY",
     "test-only-jwt-secret-key-that-is-at-least-32-characters",
+)
+os.environ.setdefault(
+    "SMTP_CREDENTIAL_ENCRYPTION_KEY",
+    Fernet.generate_key().decode("ascii"),
 )
 
 import pytest

@@ -412,6 +412,280 @@ Developer-defined permission keys:
 
 The settings router enforces the corresponding `settings.*` permission on every endpoint. `/api/auth/me` resolves and returns the current effective role and permission keys from the database, so role changes, permission removals, and membership revocation take effect on the next protected request.
 
+## Mail sender accounts
+
+Sender accounts are scoped to the workspace selected by the bearer token. Clients never submit a tenant ID. The Mail menu uses three independent permissions:
+
+- `mail.view` — list and read sender-account configuration.
+- `mail.manage` — create, update, deactivate, delete, and set a default sender.
+- `mail.test` — authenticate an SMTP connection or explicitly send a test email.
+
+The migration grants these permissions only to the system Owner role. Other system or custom roles receive no Mail access until an Owner explicitly updates their menu permissions. Every non-view Mail action also requires `mail.view` when assigned through Menu Permission.
+
+Endpoints:
+
+- `GET /api/mail/sender-accounts?page=1&size=20&include_inactive=true`
+- `POST /api/mail/sender-accounts`
+- `GET /api/mail/sender-accounts/{sender_account_id}`
+- `PATCH /api/mail/sender-accounts/{sender_account_id}`
+- `POST /api/mail/sender-accounts/{sender_account_id}/deactivate`
+- `DELETE /api/mail/sender-accounts/{sender_account_id}`
+- `POST /api/mail/sender-accounts/{sender_account_id}/set-default`
+- `POST /api/mail/sender-accounts/{sender_account_id}/test-connection`
+- `POST /api/mail/sender-accounts/{sender_account_id}/test-email`
+
+Create a custom SMTP sender:
+
+```json
+{
+  "display_name": "Sales Team",
+  "sender_email": "sales@example.com",
+  "provider": "custom_smtp",
+  "authentication_type": "password",
+  "smtp_host": "smtp.example.com",
+  "smtp_port": 587,
+  "encryption": "STARTTLS",
+  "smtp_username": "sales@example.com",
+  "credential": "server-password-or-provider-token",
+  "reply_to": "replies@example.com",
+  "is_active": true,
+  "is_default": true
+}
+```
+
+Create a Gmail sender:
+
+```json
+{
+  "display_name": "Sales Team",
+  "sender_email": "sales@gmail.com",
+  "provider": "gmail",
+  "authentication_type": "app_password",
+  "credential": "google-app-password",
+  "encryption": "STARTTLS"
+}
+```
+
+Gmail uses `smtp.gmail.com`; the defaults are port 587 with STARTTLS (or port 465 with TLS). The credential must be a Google App Password for an account where Google supports App Passwords. A normal Gmail account password is not accepted or recommended. OAuth is not implemented and must not be selected as an authentication type.
+
+Update requests may omit `credential` to preserve the encrypted credential already stored. Sending a JSON `null` or blank credential is rejected. API responses never return the credential or its ciphertext; they return only `credentials_configured`.
+
+Example response data:
+
+```json
+{
+  "id": "sender-account-uuid",
+  "display_name": "Sales Team",
+  "sender_email": "sales@example.com",
+  "provider": "custom_smtp",
+  "authentication_type": "password",
+  "smtp_host": "smtp.example.com",
+  "smtp_port": 587,
+  "encryption": "STARTTLS",
+  "smtp_username": "sales@example.com",
+  "credentials_configured": true,
+  "reply_to": "replies@example.com",
+  "is_active": true,
+  "is_default": true,
+  "connection_status": "not_tested",
+  "last_tested_at": null,
+  "last_test_message": null,
+  "created_at": "2026-10-11T12:00:00Z",
+  "updated_at": "2026-10-11T12:00:00Z"
+}
+```
+
+Connection testing performs SMTP authentication and sends no email. It records only a sanitized success/failure status and time. Sending a test email is a separate, rate-limited request:
+
+```json
+{
+  "recipient": "recipient@example.com"
+}
+```
+
+Saving an account never opens an SMTP connection or sends email. SMTP operations use verified TLS certificates, bounded timeouts/concurrency, public-address DNS validation, and an IP-pinned connection. Loopback, private, link-local, reserved, metadata, and DNS-rebinding destinations are rejected. Supported SMTP ports are 25, 465, 587, and 2525, and authentication is never attempted without STARTTLS or TLS.
+
+Only one default sender may exist per workspace; this is transactionally enforced and backed by a partial unique database index. Deactivation clears default status. If an installed message-history table references a sender through `sender_account_id`, delete deactivates the account instead, retaining the account and audit history.
+
+Required server-side environment configuration:
+
+```dotenv
+SMTP_CREDENTIAL_ENCRYPTION_KEY=
+SMTP_CREDENTIAL_PREVIOUS_KEYS=
+SMTP_CONNECTION_TIMEOUT_SECONDS=10
+SMTP_MAX_CONCURRENT_OPERATIONS=5
+SMTP_TEST_EMAIL_RATE_LIMIT_REQUESTS=5
+SMTP_TEST_EMAIL_RATE_LIMIT_WINDOW_SECONDS=300
+```
+
+`SMTP_CREDENTIAL_ENCRYPTION_KEY` is required before SMTP credentials can be saved or used. Its value must be one Fernet key: URL-safe Base64 encoding of exactly 32 random bytes (normally a 44-character string). Do not use an arbitrary password, JWT secret, Gmail App Password, quoted value, or a value containing a newline.
+
+Generate a compatible Fernet key locally:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Copy the generated value directly into the server secret setting. The command prints a newly generated encryption key only; it never reads or prints an existing key or SMTP credential.
+
+### Render setup
+
+In the Render dashboard, open the backend Web Service, select **Environment**, and add:
+
+```text
+Key:   SMTP_CREDENTIAL_ENCRYPTION_KEY
+Value: <the complete generated Fernet key, without quotes>
+```
+
+Save the environment change and allow Render to redeploy/restart the service. Environment variables are read when the FastAPI process starts, so an already-running process must restart before the new value is available. `pydantic-settings` reads this uppercase process variable directly, case-insensitively, and process environment values take precedence over the local `.env` file. A production `.env` file is therefore not required on Render.
+
+Do not put the generated value in `.env.example`, Git, frontend environment files, build arguments, or Angular. `.env.example` intentionally contains only an empty placeholder.
+
+Store the real encryption key in the deployment secret manager, not source control or Angular. Back it up separately and securely: losing every copy makes stored SMTP credentials unrecoverable. To rotate, deploy a new `SMTP_CREDENTIAL_ENCRYPTION_KEY`, retain old keys as a comma-separated `SMTP_CREDENTIAL_PREVIOUS_KEYS`, and re-save each credential so it is encrypted by the new primary key. Remove a previous key only after all affected credentials have been re-encrypted and verified. Never log either key.
+
+The module exposes `app/services/sender_account_service.py` and the asynchronous SMTP provider for future workflow delivery. Lead/workflow messaging is intentionally not connected in this change; future sending must independently enforce approved templates, consent/suppression, tenant scope, idempotency, and stop rules.
+
+## Mail templates
+
+Mail templates are scoped to the workspace selected by the authenticated membership. The API never accepts a tenant ID and never sends an email during create, update, upload, approval, archive, or preview.
+
+Permissions:
+
+- `mail.templates.view` — list, read, preview, and retrieve authorized private assets.
+- `mail.templates.manage` — create, update, archive, upload, and remove draft assets.
+- `mail.templates.approve` — enter the approval endpoint; final approval also requires the current membership to have the system `owner` role.
+
+The migration grants these permissions only to the system Owner role. They are not automatically granted to Operator, Staff, Readonly, or custom roles.
+
+Endpoints:
+
+- `GET /api/mail/templates/placeholders`
+- `GET /api/mail/templates?page=1&size=20&search=&enabled=&approval_status=&include_archived=false`
+- `POST /api/mail/templates`
+- `GET /api/mail/templates/{template_id}?version=1&include_archived=false`
+- `PATCH /api/mail/templates/{template_id}`
+- `DELETE /api/mail/templates/{template_id}` — archives rather than physically deleting.
+- `POST /api/mail/templates/{template_id}/approve`
+- `POST /api/mail/templates/{template_id}/preview`
+- `POST /api/mail/templates/{template_id}/assets`
+- `GET /api/mail/templates/{template_id}/assets/{asset_id}/content`
+- `DELETE /api/mail/templates/{template_id}/assets/{asset_id}`
+
+Create request:
+
+```json
+{
+  "name": "Initial Outreach",
+  "subject": "Hello {{first_name}}",
+  "body_html": "<p>Hi {{first_name}}, welcome to <strong>{{company}}</strong>.</p>",
+  "signature_html": "<p>Regards,<br>Sales Team</p>",
+  "enabled": true
+}
+```
+
+`PATCH` accepts the same fields optionally. Names are trimmed and unique case-insensitively among active templates in the workspace. Subjects reject CR/LF header injection. HTML is sanitized server-side before persistence, and `body_text`/`signature_text` are derived from the sanitized HTML.
+
+Allowed placeholder keys:
+
+- `first_name`
+- `last_name`
+- `email`
+- `phone`
+- `company`
+- `designation`
+- `service_requested`
+- `city`
+- `state`
+- `country`
+- `industry`
+- `company_website`
+- `company_size`
+
+Literal content such as `Hi Arif` is valid. Placeholder syntax is deliberately limited to `{{field_name}}`; arbitrary expressions, function calls, attribute access, malformed tokens, and unknown fields are rejected. Substituted values are HTML-escaped. Missing preview values remain visibly unresolved and are returned in `missing_values`; no replacement is invented.
+
+Preview with sample values:
+
+```json
+{
+  "sample_values": {
+    "first_name": "Arif",
+    "company": "PowerLead"
+  },
+  "version": 1
+}
+```
+
+Preview with an authorized lead:
+
+```json
+{
+  "lead_id": "lead_uuid"
+}
+```
+
+`lead_id` and `sample_values` are mutually exclusive. Lead lookup uses the existing tenant and assigned-lead authorization rules. The response contains `rendered_subject`, `rendered_body_html`, `rendered_signature_html`, combined `rendered_html`, `rendered_text`, `missing_values`, `warnings`, and authorized asset-content URLs. Preview never contacts SMTP.
+
+### Template lifecycle
+
+New templates start as version 1 with `approval_status=draft`. Only a workspace Owner with `mail.templates.approve` can approve the current draft. Approved rows and their asset links are immutable. Editing approved subject/body/signature or adding/removing an asset creates the next draft version and copies the prior version's asset references. Future workflow delivery must select an exact approved version; the reusable composer refuses draft versions. Archiving disables the template but preserves every version and asset reference for historical-message integrity.
+
+### Asset uploads
+
+Upload with multipart form data:
+
+```text
+POST /api/mail/templates/{template_id}/assets
+kind: inline_body | signature_image | attachment
+file: <binary file>
+```
+
+The response for an inline image supplies markup such as:
+
+```html
+<img data-asset-id="asset_uuid" alt="">
+```
+
+Insert that markup into `body_html` for `inline_body` or `signature_html` for `signature_image`. Preview returns authorized content URLs; raw object-storage URLs and filesystem paths are never exposed. MIME composition converts the asset ID into a Content-ID reference and adds HTML plus plain-text alternatives. `attachment` assets are normal MIME attachments.
+
+Allowed inline/signature image contents: PNG, JPEG, GIF, and WebP. Allowed attachment contents: those images plus PDF, DOCX, XLSX, UTF-8 TXT, and CSV. Detection uses file signatures/container contents rather than trusting the submitted extension or MIME type. Executables, scripts, HTML, SVG, macro-bearing Office containers, embedded Office objects, unknown binary data, and remote image URLs are rejected. Files receive generated tenant-scoped object keys.
+
+Defaults:
+
+- Maximum individual asset: 10 MiB.
+- Maximum assets per version: 20.
+- Maximum estimated encoded message size: 25 MiB, including MIME Base64 overhead.
+- API pagination size: 1–100.
+
+Unreferenced draft assets are removed from object storage and PostgreSQL when explicitly deleted. Assets still referenced by an approved or historical version are retained. Uploaded image assets must be referenced by the correct body/signature HTML location before approval.
+
+HTML supports paragraphs, line breaks, bold, italic, underline, ordered/unordered lists, safe HTTP/HTTPS/mailto links, text color, alignment, and uploaded images. Scripts, event handlers, unsafe elements, remote image sources, unsafe URL schemes, CSS expressions, and CSS URL fetching are rejected. Image-only signatures are valid when they reference an authorized uploaded signature asset.
+
+### Persistent object storage
+
+Template binaries are never written to Render's temporary filesystem. Configure a private S3-compatible bucket using server-side environment variables:
+
+```dotenv
+OBJECT_STORAGE_BUCKET=
+OBJECT_STORAGE_REGION=us-east-1
+OBJECT_STORAGE_ENDPOINT_URL=
+OBJECT_STORAGE_ACCESS_KEY_ID=
+OBJECT_STORAGE_SECRET_ACCESS_KEY=
+OBJECT_STORAGE_USE_SSL=true
+MAIL_TEMPLATE_ASSET_MAX_FILE_BYTES=10485760
+MAIL_TEMPLATE_MAX_ASSETS=20
+MAIL_TEMPLATE_MAX_TOTAL_BYTES=26214400
+```
+
+For AWS S3, `OBJECT_STORAGE_ENDPOINT_URL` may remain empty. For an S3-compatible provider, set its HTTPS endpoint. Keep access keys only in the backend secret manager; never expose them to Angular or commit them. The bucket must be persistent and private. Objects are accessed through the authenticated API, use generated keys, request server-side encryption, and are never made public.
+
+Apply the template migration with:
+
+```powershell
+.\.venv\Scripts\alembic.exe upgrade head
+```
+
+Current template migration revision: `c8d4f1a29b60`.
+
 ## Local workspace bootstrap
 
 No existing user is promoted automatically. After applying migrations, explicitly create or reuse a local workspace and assign an existing account as Owner with:
@@ -698,4 +972,578 @@ pytest
 ```
 
 Tests use an isolated in-memory database and do not change PostgreSQL data.
+
+## Message templates
+
+Plain-text Message Templates are tenant-scoped and separate from Email Templates.
+They use `mail.templates.view` for list/detail/preview and
+`mail.templates.manage` for create/update/archive. Routes are rooted at
+`/api/message-templates`; preview accepts either an authorized `lead_id` or an
+allowlisted `sample_values` object and never sends a message. Deletion archives the
+record so IDs and audit history remain available. Message Templates have no subject,
+signature, assets, SMTP sender, sending behavior, or Email Template approval lifecycle.
+
+Apply the table migration with:
+
+```powershell
+alembic upgrade head
+```
+
+## Phase 7 outbound email
+
+The original single-message flow remains a two-step operation. `POST
+/api/mail/messages/preview` creates an expiring server-side snapshot and returns the
+exact recipient, rendered subject, HTML, plain text and a content hash. `POST
+/api/mail/messages/send` accepts that preview ID/hash plus an idempotency key and
+transactionally creates an immutable message snapshot and durable outbox job. Neither
+preview nor lead/customer save sends email.
+
+Explicit Lead List sends use `POST /api/mail/batches/send`. This endpoint does not
+require a prior preview and does not create outbox jobs. It resolves authorized leads,
+renders immutable personalized snapshots, persists them, and calls the same protected
+SMTP transport used by Sender Account test-email. It waits for the bounded direct
+attempts and returns each recipient as `sent`, `failed`, `unknown`, or `skipped`.
+SMTP acceptance means `sent`; it does not mean delivered or read. Timeout or ambiguous
+acceptance is `unknown` and is never automatically retried. The default direct limit is
+10 recipients per request, concurrency is 3, and the per-message timeout is 30 seconds
+(`MAIL_DIRECT_SEND_MAX_RECIPIENTS`, `MAIL_DIRECT_SEND_CONCURRENCY`, and
+`MAIL_DIRECT_SEND_TIMEOUT_SECONDS`). Existing preview/confirm endpoints and worker
+jobs remain available for other consumers and workflow features.
+
+`supersede_queued` defaults to `false`, preserving normal duplicate-send
+protection. When an authorized user explicitly sets it to `true`, the direct-send
+transaction may cancel an older worker-backed message only when that message is
+still queued, its job has no lease, and no SMTP attempt has begun. The old message,
+job, events, activity and audit history are retained. Processing, sent, unknown,
+leased or previously attempted messages are never superseded.
+
+If a browser disconnects, repeat the same request only with the same idempotency key,
+or query `GET /api/mail/batches/{batch_id}` and `GET
+/api/mail/batches/{batch_id}/recipients`. Reusing the key with changed content is
+rejected. A replay returns the stored result and does not contact SMTP again. Direct
+responses also report the workspace's existing `pending_worker_job_count`; those jobs
+are not processed, changed, or retried by the direct endpoint.
+
+Required permissions are `mail.send` for preview/enqueue, `mail.view` for list/status,
+and `mail.cancel` for cancellation. Owner receives all permissions; operator receives
+send/cancel by the migration. Record visibility and staff assigned-lead scope are still
+enforced.
+
+Run the API and durable worker as separate Render services using the same database,
+storage and secret environment:
+
+```powershell
+uvicorn app.main:app --host 0.0.0.0 --port $env:PORT
+python -m app.commands.process_outbox
+```
+
+For a one-batch health/debug run use `python -m app.commands.process_outbox --once`.
+On Render, configure the API as a Web Service and the worker as a Background Worker.
+Do not run the worker as a one-off release command. Apply migrations before starting
+the new services:
+
+```powershell
+alembic upgrade head
+```
+
+In addition to the existing SMTP encryption and object-storage variables, the worker
+accepts `MAIL_PREVIEW_EXPIRE_MINUTES`, `MAIL_WORKER_POLL_SECONDS`,
+`MAIL_WORKER_BATCH_SIZE`, `MAIL_WORKER_CONCURRENCY`, `MAIL_WORKER_LEASE_SECONDS`,
+`MAIL_WORKER_MAX_ATTEMPTS`, `MAIL_WORKER_SENDER_RATE_PER_MINUTE`,
+`MAIL_WORKER_WORKSPACE_RATE_PER_MINUTE`, and `MAIL_MAX_ENCODED_MESSAGE_BYTES`.
+Real deployments must permit outbound DNS and SMTP traffic to the configured public
+SMTP host/port. TLS certificate verification and the existing private/link-local/
+metadata destination blocks remain enabled.
+
+Eligibility (purpose, conversion state, consent, opt-out/suppression and email state)
+is checked at preview/enqueue and again immediately before the provider call. SMTP
+acceptance is recorded as `sent`, not delivered/read. An exception after the SMTP
+send begins is recorded as `unknown` and is never automatically retried. Cancellation
+works for queued/retry jobs; a provider call already in flight cannot be recalled, so
+processing jobs return `409` and conversion records a cancellation request for the
+worker's final pre-send check.
+
+## Direct Lead SMS (Twilio Programmable Messaging)
+
+Lead SMS uses Twilio Programmable Messaging through `POST /api/sms/send`; it does
+not use Twilio Verify, create an outbox job, or require a preview. The server resolves
+authorized leads, renders the tenant's existing plain-text Message Template separately
+for every lead, stores the immutable body/template/sender snapshot, and then calls
+Twilio with bounded concurrency. The default request limit is 10 recipients,
+concurrency is 3, and each provider call has a 20-second timeout. Twilio may queue
+messages according to the account and sender throughput limits.
+Rendered SMS content is capped at 1,600 Unicode characters before submission;
+carrier segmentation and billing remain provider concerns.
+
+Configure these server-only values in `.env` or the hosting environment:
+
+```dotenv
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_SMS_FROM=
+SMS_DIRECT_SEND_MAX_RECIPIENTS=10
+SMS_DIRECT_SEND_CONCURRENCY=3
+SMS_DIRECT_SEND_TIMEOUT_SECONDS=20
+SMS_STATUS_REFRESH_MIN_SECONDS=30
+```
+
+`TWILIO_SMS_FROM` is the Twilio sender used by Programmable Messaging. Lead phones
+must already be in international E.164 form (for example `+14155552671`); the backend
+does not infer a country code. Trial-recipient verification, sender capability,
+geographic permissions, registration requirements, and content restrictions remain
+Twilio/account responsibilities. A successful create call records Twilio's returned
+`accepted`, `queued`, `sent`, or `delivered` state exactly; it never upgrades API
+acceptance to delivery.
+
+Use `GET /api/sms/batches/{batch_id}` after a browser timeout. Read an individual
+record at `GET /api/sms/messages/{message_id}` and request a bounded provider lookup
+with `POST /api/sms/messages/{message_id}/refresh-status`. Refresh calls are throttled
+by `SMS_STATUS_REFRESH_MIN_SECONDS`; webhooks/tunnels are not required for local
+status checks. Repeating a send with the same idempotency key returns its original
+batch, while changed content with that key is rejected.
+
+If the browser never received a batch ID, recover the original operation without
+submitting another send request:
+
+```text
+GET /api/sms/operations/recover?idempotency_key=<original-key>
+```
+
+Recovery requires `mail.view`, is limited to the user who originated the operation,
+and returns `missing`, `in_progress`, or `completed`. It never contacts Twilio and
+never creates or retries a message. A pre-provider configuration failure returns HTTP
+503 with `classification=pre_provider_failure` and `provider_request_made=false`.
+Definitive Twilio rejections are stored as `failed`; transport timeouts or ambiguous
+provider acceptance are stored as `unknown`. Provider acceptance is committed per
+recipient, with a bounded database-only persistence retry that never repeats the
+Twilio request.
+
+SMS send uses the existing `mail.send` permission; batch/message status and refresh
+use `mail.view`. Staff scope remains limited to assigned leads. Explicit denied or
+withdrawn consent, archived/disqualified/converted lead state, invalid phone data,
+and duplicate recipients remain blocked. Non-denied consent is not changed or
+implicitly promoted to granted.
 "# Power-Lead-Response-V1" 
+## WhatsApp Sandbox inbox
+
+The WhatsApp inbox uses Twilio Programmable Messaging and the existing tenant,
+membership, permission and lead-activity infrastructure. It receives inbound
+Sandbox messages, stores one workspace-scoped conversation per external WhatsApp
+address, supports explicit free-form replies during the 24-hour customer-service
+window, and records delivery callbacks. It does not send from the Lead List and
+does not treat application Message Templates as WhatsApp-approved templates.
+
+### Configuration
+
+Keep real values in `.env` or the deployment secret manager. The repository
+contains only blank placeholders in `.env.example`.
+
+```dotenv
+TWILIO_ACCOUNT_SID=
+TWILIO_AUTH_TOKEN=
+TWILIO_WHATSAPP_FROM=
+TWILIO_WHATSAPP_WEBHOOK_BASE_URL=
+WHATSAPP_REPLY_MAX_CHARACTERS=1600
+WHATSAPP_REPLY_TIMEOUT_SECONDS=20
+WHATSAPP_REPLY_RATE_LIMIT_REQUESTS=30
+WHATSAPP_REPLY_RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+`TWILIO_WHATSAPP_FROM` accepts `+E164` or `whatsapp:+E164`; the provider always
+uses `whatsapp:+E164`. `TWILIO_WHATSAPP_WEBHOOK_BASE_URL` is the public HTTPS
+origin without a trailing slash. It is used both for exact Twilio signature
+validation behind a proxy and for the outbound status callback URL.
+
+Apply the reviewed migration explicitly (the application does not run it):
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+With `LIVE=false`, map the configured Sandbox sender to one existing workspace.
+The command is transactional and idempotent, and refuses a sender already mapped
+to another workspace:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.commands.map_whatsapp_channel --workspace-slug <exact-workspace-slug>
+```
+
+### Local tunnel and Twilio Sandbox
+
+1. Run the API: `.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload`.
+2. Expose it, for example with `ngrok http 8000`.
+3. Set `TWILIO_WHATSAPP_WEBHOOK_BASE_URL=https://<your-ngrok-host>` and restart.
+4. In the Twilio WhatsApp Sandbox configuration, set **When a message comes in**
+   to the following HTTP `POST` URL:
+
+   `https://<your-ngrok-host>/api/webhooks/twilio/whatsapp/inbound`
+
+Outbound replies automatically pass this status callback URL:
+
+`https://<your-ngrok-host>/api/webhooks/twilio/whatsapp/status`
+
+Both webhook endpoints validate `X-Twilio-Signature` using the complete external
+URL and all form parameters. They do not accept application JWTs. Do not put a
+query string in the Twilio Console URL unless the same query string reaches the
+application exactly.
+
+### Permissions
+
+- `messages.view`: list conversations/history and mark a conversation read.
+- `messages.send`: send explicit replies, recover send operations and link a
+  conversation to an authorized lead/customer.
+
+The migration grants both only to the system Owner role. Other roles receive no
+automatic WhatsApp access. An Owner can grant them through the existing Menu
+Permission screen/API: read the complete current set with
+`GET /api/settings/roles/{role_id}/permissions`, then send the complete updated
+set to `PUT /api/settings/roles/{role_id}/permissions` as
+`{"permission_keys":[...,"messages.view","messages.send"]}`. The existing rule
+requires `messages.view` whenever `messages.send` is granted.
+
+### Authenticated API
+
+- `GET /api/messages/whatsapp/conversations?page=1&size=20&search=`
+- `GET /api/messages/whatsapp/conversations/{conversation_id}/messages?page=1&size=50`
+- `POST /api/messages/whatsapp/conversations/{conversation_id}/reply`
+- `POST /api/messages/whatsapp/conversations/{conversation_id}/read`
+- `PUT /api/messages/whatsapp/conversations/{conversation_id}/link`
+- `GET /api/messages/whatsapp/operations/recover?idempotency_key=<key>`
+
+Reply request:
+
+```json
+{
+  "body": "Thanks for contacting us.",
+  "idempotency_key": "wa-reply-20261022-0001"
+}
+```
+
+Reply success data includes `message`, `replayed`, and `operation_state`. The
+message carries its provider status (`accepted`, `queued`, `sending`, `sent`,
+`delivered`, `read`, `failed`, `undelivered`, or `unknown`) separately from the
+application submission state. Accepted/queued never means delivered.
+
+When the free-form window is closed, the API returns HTTP `409` with code
+`approved_template_required` and does not call Twilio. Reusing an idempotency key
+with changed content returns HTTP `409` with code `idempotency_conflict`. The
+recovery endpoint returns `missing`, `in_progress`, or `completed` without
+submitting another provider request.
+
+Link request (exactly one field):
+
+```json
+{"lead_id":"<authorized-lead-uuid>"}
+```
+
+or
+
+```json
+{"customer_id":"<authorized-customer-uuid>"}
+```
+
+Incoming media URLs are never exposed or retained. Authorized clients receive
+only safe media metadata and an unsupported-media placeholder until media support
+is implemented.
+
+## Meta WhatsApp Cloud API inbox
+
+Meta Cloud API is a separate provider integration. It does not replace, merge or
+fall back to the Twilio WhatsApp channel. Conversations are keyed by workspace,
+provider channel and external contact, so the same phone number can have separate
+Twilio and Meta histories.
+
+### Configuration and workspace mapping
+
+Store real values only in `.env` or the deployment secret manager:
+
+```dotenv
+META_WHATSAPP_ACCESS_TOKEN=
+META_WHATSAPP_PHONE_NUMBER_ID=
+META_WHATSAPP_WABA_ID=
+META_APP_SECRET=
+META_WEBHOOK_VERIFY_TOKEN=
+META_GRAPH_API_VERSION=v26.0
+META_WHATSAPP_TIMEOUT_SECONDS=20
+META_WHATSAPP_SEND_RATE_LIMIT_REQUESTS=30
+META_WHATSAPP_SEND_RATE_LIMIT_WINDOW_SECONDS=60
+META_WHATSAPP_TEMPLATE_FETCH_LIMIT=500
+```
+
+`META_APP_SECRET`, the access token and verify token are server-only and are never
+returned by an API. `META_GRAPH_API_VERSION` is configurable so a supported Graph
+version can be advanced without changing code.
+
+Apply the reviewed migration explicitly; application startup never runs it:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+Map the configured WABA ID and Phone Number ID to the existing workspace. The
+command is transactional and idempotent, and does not alter the Twilio mapping:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.commands.map_meta_whatsapp_channel --workspace-slug <exact-workspace-slug> --sender-address <+E164-Meta-sender>
+```
+
+### Meta webhook setup
+
+1. Expose the API on a stable public HTTPS origin.
+2. In the Meta app dashboard, open WhatsApp/Webhooks configuration and set the
+   callback URL to `https://<host>/api/webhooks/meta/whatsapp`.
+3. Enter the same server-side value configured as `META_WEBHOOK_VERIFY_TOKEN`.
+   Meta's `GET` verification receives the exact challenge as plain text.
+4. Subscribe the WhatsApp Business Account to the app and subscribe the
+   `messages` webhook field. WABA app subscription can be checked/created using
+   Graph API `GET/POST /<WABA_ID>/subscribed_apps` with an appropriately
+   authorized token.
+5. Confirm inbound and status callbacks contain the configured WABA ID and Phone
+   Number ID. The backend rejects any other mapping.
+
+Every `POST` webhook is validated from the raw request bytes with
+`X-Hub-Signature-256` and `META_APP_SECRET`. Messages/status events are deduplicated
+in PostgreSQL. Unsupported media creates a safe placeholder; the backend neither
+downloads remote media nor automatically replies or creates a lead.
+The verification token is redacted from the server access-log query string.
+
+Meta's development/test phone number is restricted to the recipients configured
+in the app's API Setup test-recipient list. Production behavior requires a properly
+registered and active business phone number, suitable access token/permissions,
+business/account eligibility and compliance with WhatsApp messaging/opt-in and
+template rules. The application does not bypass these provider restrictions.
+
+### Permissions and APIs
+
+The Meta routes reuse `messages.view` and `messages.send`; no new role grant is
+created. Staff remains limited to linked leads/customers in assigned-lead scope.
+
+```text
+GET  /api/messages/meta/whatsapp/channel
+GET  /api/messages/meta/whatsapp/conversations?page=1&size=20&search=
+POST /api/messages/meta/whatsapp/conversations/open
+GET  /api/messages/meta/whatsapp/conversations/{id}/messages?page=1&size=50
+POST /api/messages/meta/whatsapp/conversations/{id}/read
+PUT  /api/messages/meta/whatsapp/conversations/{id}/link
+GET  /api/messages/meta/whatsapp/templates?page=1&size=20&search=
+POST /api/messages/meta/whatsapp/send
+GET  /api/messages/meta/whatsapp/operations/recover?idempotency_key=<key>
+GET  /api/webhooks/meta/whatsapp
+POST /api/webhooks/meta/whatsapp
+```
+
+Opening/finding a conversation never sends:
+
+```json
+{"phone_number":"+14155552671"}
+```
+
+Its response includes `eligibility.free_form_allowed`,
+`service_window_expires_at`, `approved_template_required`,
+`template_outreach_allowed` and structured restrictions calculated by the server.
+
+Explicit service-window text send:
+
+```json
+{
+  "conversation_id": "<conversation-uuid>",
+  "mode": "text",
+  "text": "Thanks for contacting us.",
+  "purpose": "lead_acquisition",
+  "idempotency_key": "meta-wa-20261024-0001"
+}
+```
+
+Explicit approved-template send:
+
+```json
+{
+  "phone_number": "+14155552671",
+  "mode": "approved_template",
+  "template": {
+    "name": "lead_intro",
+    "language": "en_US",
+    "parameters": [
+      {"component":"body","index":1,"value":"Arif"},
+      {"component":"body","index":2,"value":"PowerLead"}
+    ]
+  },
+  "purpose": "lead_acquisition",
+  "idempotency_key": "meta-wa-20261024-0002"
+}
+```
+
+The server fetches templates from the configured WABA, requires exact name and
+language, permits only provider status `APPROVED`, and validates the complete
+parameter positions against the provider definition. Local Message Templates are
+not treated as Meta-approved templates and arbitrary browser-rendered template
+content is not accepted.
+
+Successful send processing returns the persisted message, `replayed`, and
+`operation_state`. Provider acceptance is stored as `accepted`; it is not described
+as delivered/read until a matching webhook status is persisted. Definitive Meta
+rejections become `failed`; ambiguous network/response outcomes become `unknown`
+and are never retried automatically or sent through Twilio.
+
+Representative safe errors:
+
+```json
+{
+  "detail": {
+    "code": "approved_template_required",
+    "message": "The customer-service window is closed; use an approved Meta template",
+    "service_window_expires_at": "2026-10-24T12:00:00+00:00"
+  }
+}
+```
+
+```json
+{
+  "detail": {
+    "code": "whatsapp_opt_in_required",
+    "message": "Business-initiated WhatsApp templates require recorded opt-in"
+  }
+}
+```
+
+Other stable codes include `invalid_phone_number`, `recipient_mismatch`,
+`template_not_found`, `template_not_approved`, `invalid_template_parameters`,
+`messaging_consent_denied`, `customer_suppressed`, `channel_restricted`,
+`customer_purpose_required`, `idempotency_conflict`, and
+`meta_whatsapp_channel_not_configured`.
+
+An idempotency key is unique within a workspace operation. Repeating the identical
+request returns the original record without a provider call; changed content is a
+conflict. Recovery is read-only and returns `missing`, `in_progress`, or `completed`:
+
+```json
+{
+  "success": true,
+  "data": {
+    "idempotency_key": "meta-wa-20261024-0001",
+    "found": true,
+    "operation_state": "completed",
+    "message": {"id":"<message-uuid>","status":"accepted","provider_message_id":"wamid..."}
+  }
+}
+```
+
+## Facebook Page Messenger webhook
+
+Messenger webhook ingestion reuses the tenant-scoped messaging channel,
+conversation, message and delivery-event storage. Page-scoped user IDs remain
+scoped to the mapped Page channel and are not merged with WhatsApp phone
+identities or contacts by name.
+
+Configure secrets only in `.env` or the deployment secret manager:
+
+```dotenv
+META_MESSENGER_VERIFY_TOKEN=
+META_MESSENGER_PAGE_ID=
+META_MESSENGER_PAGE_ACCESS_TOKEN=
+META_MESSENGER_APP_SECRET=
+META_MESSENGER_TIMEOUT_SECONDS=20
+META_MESSENGER_REPLY_MAX_CHARACTERS=2000
+META_MESSENGER_REPLY_RATE_LIMIT_REQUESTS=30
+META_MESSENGER_REPLY_RATE_LIMIT_WINDOW_SECONDS=60
+META_MESSENGER_PROFILE_CACHE_HOURS=24
+META_MESSENGER_PROFILE_RETRY_SECONDS=900
+META_MESSENGER_PROFILE_REFRESH_LIMIT=25
+META_MESSENGER_PROFILE_REFRESH_CONCURRENCY=4
+META_MESSENGER_PROFILE_REFRESH_RATE_LIMIT_REQUESTS=5
+META_MESSENGER_PROFILE_REFRESH_RATE_LIMIT_WINDOW_SECONDS=60
+```
+
+`META_MESSENGER_APP_SECRET` takes precedence. It may be left blank only when
+Messenger and WhatsApp use the same Meta app, in which case `META_APP_SECRET` is
+reused. `META_GRAPH_API_VERSION` is also used for Messenger Send API calls.
+
+Apply the reviewed migration explicitly; application startup does not apply it:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+Map the configured Page ID to one existing workspace. The command is
+transactional and idempotent and will not move a Page already owned by another
+workspace:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.commands.map_meta_messenger_page --workspace-slug <exact-workspace-slug>
+```
+
+Configure the Meta Page webhook callback as:
+
+```text
+https://<host>/api/webhooks/meta/messenger
+```
+
+Use `META_MESSENGER_VERIFY_TOKEN` for callback verification and subscribe the
+Page webhook to `messages`, `message_echoes`, `message_deliveries` and
+`message_reads`. The backend accepts text and attachment-bearing message events,
+stores safe attachment placeholders without fetching remote URLs, persists and
+reconciles echo/delivery/read events, deduplicates provider identifiers, and
+safely ignores other valid event types. Webhook endpoints do not require an
+application JWT:
+
+```text
+GET  /api/webhooks/meta/messenger
+POST /api/webhooks/meta/messenger
+```
+
+Authenticated inbox APIs use the existing `messages.view` and `messages.send`
+permissions. They derive the workspace and Page-scoped recipient from the
+selected membership/conversation; a client cannot provide a tenant ID or PSID
+for a reply:
+
+```text
+GET  /api/messages/meta/messenger/channel
+POST /api/messages/meta/messenger/profiles/refresh
+GET  /api/messages/meta/messenger/conversations?page=1&size=20&search=
+GET  /api/messages/meta/messenger/conversations/{conversation_id}/messages?page=1&size=50
+POST /api/messages/meta/messenger/conversations/{conversation_id}/read
+PUT  /api/messages/meta/messenger/conversations/{conversation_id}/link
+POST /api/messages/meta/messenger/conversations/{conversation_id}/reply
+GET  /api/messages/meta/messenger/operations/recover?idempotency_key=...
+```
+
+Inbox reads use cached display names and never issue one provider request per
+row. To populate or refresh an existing Page and up to 25 accessible contacts,
+call the rate-limited refresh endpoint with `messages.view`:
+
+```json
+{
+  "conversation_ids": ["<conversation-uuid>"],
+  "refresh_page": true
+}
+```
+
+An empty `conversation_ids` list refreshes a bounded set of unresolved visible
+conversations. Successful Page/contact names are cached for 24 hours. Restricted
+or unavailable profiles receive a 15-minute retry backoff. Failed lookups leave
+the inbox usable with `Facebook Page` and `Messenger user` fallbacks. A linked
+lead/customer name always takes precedence over provider profile data.
+
+The provider requests only Page `name` and Messenger user `first_name,last_name`.
+The configured token must belong to the mapped Page. Meta conversation/profile
+access can require `pages_manage_metadata`, `pages_read_engagement`,
+`pages_messaging`, a Page task that permits messaging/moderation, and Advanced
+Access/Business Asset User Profile Access for people without an app/Page role.
+Unavailable fields are treated as restricted rather than inferred.
+
+Reply example (text is preserved exactly and is limited to 2,000 characters):
+
+```json
+{
+  "text": "Thanks for contacting us.",
+  "idempotency_key": "messenger-reply-20261026-0001"
+}
+```
+
+Replies use `messaging_type=RESPONSE` and are allowed only while the standard
+24-hour window calculated from the last qualifying inbound user message is
+open. Echoes, receipts and CRM read cursors never open that window. This phase
+does not use message tags, `HUMAN_AGENT`, cold outreach, bulk sending or
+`mark_seen`. Provider acceptance is stored as `accepted`, not delivered/read.
+Use the GET-only recovery endpoint after a browser timeout; it never calls Meta
+or retries an unknown outcome.

@@ -41,6 +41,10 @@ class Lead(Base):
             sqlite_where=text("deleted_at IS NULL"),
         ),
         CheckConstraint("row_version >= 1", name="ck_t_lead_row_version_positive"),
+        CheckConstraint(
+            "priority IN ('low', 'normal', 'high', 'urgent')",
+            name="ck_t_lead_priority",
+        ),
         CheckConstraint("revenue_amount IS NULL OR revenue_amount >= 0", name="ck_t_lead_revenue_nonnegative"),
         CheckConstraint(
             "(revenue_amount IS NULL AND revenue_currency IS NULL AND revenue_period IS NULL) OR "
@@ -80,6 +84,9 @@ class Lead(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, server_default="new")
+    priority: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="normal", server_default="normal"
+    )
     assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("t_user.id", ondelete="SET NULL"), nullable=True
     )
@@ -138,6 +145,10 @@ class LeadCustomerAction(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="pending")
     requires_verified_consent: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("t_user.id", ondelete="RESTRICT"), nullable=True
+    )
+    cancellation_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
