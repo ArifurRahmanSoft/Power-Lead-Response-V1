@@ -41,7 +41,7 @@ class WhatsAppChannel(Base):
             name="uq_t_whatsapp_channel_provider_identity",
         ),
         CheckConstraint(
-            "provider IN ('twilio', 'meta', 'messenger')",
+            "provider IN ('twilio', 'meta', 'messenger', 'instagram')",
             name="ck_t_whatsapp_channel_provider",
         ),
         Index("ix_t_whatsapp_channel_tenant", "tenant_id"),
@@ -146,7 +146,7 @@ class WhatsAppMessage(Base):
             name="uq_t_whatsapp_message_provider_identifier",
         ),
         CheckConstraint(
-            "provider IN ('twilio', 'meta', 'messenger')",
+            "provider IN ('twilio', 'meta', 'messenger', 'instagram')",
             name="ck_t_whatsapp_message_provider",
         ),
         CheckConstraint(
@@ -227,7 +227,7 @@ class WhatsAppDeliveryEvent(Base):
     __table_args__ = (
         UniqueConstraint("event_key", name="uq_t_whatsapp_delivery_event_key"),
         CheckConstraint(
-            "provider IN ('twilio', 'meta', 'messenger')",
+            "provider IN ('twilio', 'meta', 'messenger', 'instagram')",
             name="ck_t_whatsapp_delivery_event_provider",
         ),
         CheckConstraint(

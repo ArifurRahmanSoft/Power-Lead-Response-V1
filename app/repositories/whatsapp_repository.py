@@ -84,6 +84,21 @@ def get_active_messenger_channel_by_page_id(
     )
 
 
+def get_active_instagram_channel_by_account_id(
+    database_session: Session,
+    *,
+    account_id: str,
+) -> WhatsAppChannel | None:
+    return database_session.scalar(
+        select(WhatsAppChannel).where(
+            WhatsAppChannel.provider == "instagram",
+            WhatsAppChannel.provider_account_id == account_id,
+            WhatsAppChannel.provider_channel_id == account_id,
+            WhatsAppChannel.is_active.is_(True),
+        )
+    )
+
+
 def get_channel_for_tenant(
     database_session: Session,
     *,

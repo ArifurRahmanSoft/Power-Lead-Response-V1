@@ -17,6 +17,7 @@ class SensitiveQueryRedactionMiddleware:
             in {
                 "/api/webhooks/meta/whatsapp",
                 "/api/webhooks/meta/messenger",
+                "/api/webhooks/meta/instagram",
             }
         ):
             query = parse_qsl(

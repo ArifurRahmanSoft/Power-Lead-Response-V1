@@ -27,6 +27,10 @@ from app.routers.meta_messenger import (
     router as meta_messenger_router,
     webhook_router as meta_messenger_webhook_router,
 )
+from app.routers.meta_instagram import (
+    router as meta_instagram_router,
+    webhook_router as meta_instagram_webhook_router,
+)
 
 app = FastAPI(
     title="PowerLead Response API",
@@ -148,6 +152,15 @@ app.include_router(
 app.include_router(
     meta_messenger_webhook_router,
     tags=["Meta Messenger webhooks"],
+)
+app.include_router(
+    meta_instagram_router,
+    prefix="/api/messages/meta/instagram",
+    tags=["Meta Instagram inbox"],
+)
+app.include_router(
+    meta_instagram_webhook_router,
+    tags=["Meta Instagram webhooks"],
 )
 app.include_router(
     workspaces_router,

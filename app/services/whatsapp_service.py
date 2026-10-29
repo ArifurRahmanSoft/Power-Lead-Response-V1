@@ -272,17 +272,23 @@ def _add_activity(
         return
     actor = message.requested_by_user_id
     is_messenger = message.provider == "messenger"
-    channel = "other" if is_messenger else "whatsapp"
-    inbound_note = (
-        "Incoming Facebook Messenger message recorded."
-        if is_messenger
-        else "Incoming WhatsApp message recorded."
-    )
-    outbound_note = (
-        "System Facebook Messenger submission recorded; see message events for provider status."
-        if is_messenger
-        else "System WhatsApp reply submission recorded; see message events for provider status."
-    )
+    is_instagram = message.provider == "instagram"
+    channel = "other" if is_messenger or is_instagram else "whatsapp"
+    if is_messenger:
+        inbound_note = "Incoming Facebook Messenger message recorded."
+        outbound_note = (
+            "System Facebook Messenger submission recorded; see message events for provider status."
+        )
+    elif is_instagram:
+        inbound_note = "Incoming Instagram message recorded."
+        outbound_note = (
+            "System Instagram reply submission recorded; see message events for provider status."
+        )
+    else:
+        inbound_note = "Incoming WhatsApp message recorded."
+        outbound_note = (
+            "System WhatsApp reply submission recorded; see message events for provider status."
+        )
     database_session.add(
         LeadActivity(
             tenant_id=conversation.tenant_id,
