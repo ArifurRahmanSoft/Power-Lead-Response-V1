@@ -15,6 +15,7 @@ from app.models import (  # noqa: F401
     MailTemplateVersion,
     MailTemplateVersionAsset,
     MessageTemplate,
+    MetaInstagramOAuthState,
     Lead,
     LeadCustomerAction,
     LeadEvent,

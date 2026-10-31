@@ -61,6 +61,7 @@ class WhatsAppChannel(Base):
     twilio_account_sid: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sender_address: Mapped[str] = mapped_column(String(32), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     profile_refreshed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

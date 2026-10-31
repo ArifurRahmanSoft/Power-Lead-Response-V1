@@ -28,6 +28,7 @@ from app.routers.meta_messenger import (
     webhook_router as meta_messenger_webhook_router,
 )
 from app.routers.meta_instagram import (
+    oauth_router as meta_instagram_oauth_router,
     router as meta_instagram_router,
     webhook_router as meta_instagram_webhook_router,
 )
@@ -161,6 +162,10 @@ app.include_router(
 app.include_router(
     meta_instagram_webhook_router,
     tags=["Meta Instagram webhooks"],
+)
+app.include_router(
+    meta_instagram_oauth_router,
+    tags=["Meta Instagram authorization"],
 )
 app.include_router(
     workspaces_router,

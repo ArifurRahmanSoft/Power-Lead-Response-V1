@@ -57,6 +57,11 @@ from app.services.whatsapp_service import (
     _assigned_scope,
     conversation_contact_name,
 )
+from app.utils.credential_encryption import (
+    CredentialDecryptionError,
+    CredentialEncryptionNotConfiguredError,
+    decrypt_credential,
+)
 
 
 INSTAGRAM_PROVIDER = "instagram"
@@ -157,7 +162,11 @@ def channel_for_context(
     *,
     require_send: bool = False,
 ) -> WhatsAppChannel:
-    if require_send and not provider.send_api_configured:
+    if require_send and not (
+        provider.configuration_id
+        and provider.account_id
+        and provider.graph_api_version
+    ):
         raise MetaInstagramChannelNotConfiguredError
     channel = get_channel_for_tenant(
         database_session,
@@ -171,6 +180,28 @@ def channel_for_context(
     ):
         raise MetaInstagramChannelNotConfiguredError
     return channel
+
+
+def provider_for_channel(
+    provider: MetaInstagramProvider,
+    channel: WhatsAppChannel,
+) -> MetaInstagramProvider:
+    if channel.credential_ciphertext:
+        try:
+            connected_token = decrypt_credential(channel.credential_ciphertext)
+        except (
+            CredentialDecryptionError,
+            CredentialEncryptionNotConfiguredError,
+        ) as exception:
+            raise MetaInstagramConfigurationError(
+                safe_message="The connected Instagram credential is unavailable"
+            ) from exception
+        selected = provider.with_access_token(connected_token)
+    else:
+        selected = provider
+    if not selected.send_api_configured:
+        raise MetaInstagramConfigurationError()
+    return selected
 
 
 def get_instagram_conversation_record(
@@ -333,6 +364,7 @@ async def send_reply(
     provider: MetaInstagramProvider,
 ) -> MetaInstagramSendResult:
     channel = channel_for_context(database_session, context, provider, require_send=True)
+    send_provider = provider_for_channel(provider, channel)
     conversation = get_instagram_conversation_record(database_session, context, conversation_id)
     recipient = conversation.external_address
     stored_key = _stored_idempotency_key(context.user.id, payload.idempotency_key)
@@ -422,7 +454,7 @@ async def send_reply(
             raise MetaInstagramNotFoundError
         stored.provider_request_started_at = _now()
         database_session.commit()
-        provider_result = await provider.send_text(to=recipient, body=payload.text)
+        provider_result = await send_provider.send_text(to=recipient, body=payload.text)
     except RateLimitExceededError:
         provider_error = MetaInstagramRejectedError(
             code="application_rate_limit",

@@ -1558,11 +1558,30 @@ Settings gives process variables precedence over `.env` values.
 Required Instagram variables:
 
 - `META_INSTAGRAM_CONFIG_ID`: Unified Login configuration ID from Meta App Dashboard.
+- `META_INSTAGRAM_APP_ID`: Meta app ID used as the Unified Login OAuth client ID.
 - `META_INSTAGRAM_ACCOUNT_ID`: Instagram Professional Account ID assigned to the token.
 - `META_INSTAGRAM_ACCESS_TOKEN`: server-only Business Integration System User token.
 - `META_INSTAGRAM_VERIFY_TOKEN`: private webhook challenge token.
 - `META_INSTAGRAM_APP_SECRET`: Instagram app secret for webhook signature validation.
+- `META_INSTAGRAM_OAUTH_REDIRECT_URI`: exact public HTTPS callback registered on the
+  Unified Login configuration, for example
+  `https://api.example.com/api/integrations/meta/instagram/oauth/callback`.
 - `META_GRAPH_API_VERSION`: shared supported Meta Graph API version.
+
+Instagram reconnection uses `POST /api/messages/meta/instagram/connect/initiate`
+with `settings.integrations.update`. The returned Meta authorization URL must be
+opened by the workspace administrator. Meta redirects to the dedicated callback:
+
+```text
+GET /api/integrations/meta/instagram/oauth/callback
+```
+
+The callback is not the Instagram webhook. It validates a one-time expiring state,
+exchanges the authorization code server-side, verifies that the configured
+professional account appears in `/me/assigned_instagram_accounts`, and encrypts the
+token on the tenant channel using `SMTP_CREDENTIAL_ENCRYPTION_KEY`. Codes, state and
+tokens are never returned or written to access logs. Run migration
+`b7e2c41d8f90` before using this flow.
 
 Never commit real IDs or secrets to `.env.example`. Missing account/token settings
 leave sending unavailable, and missing webhook settings cause safe webhook rejection.

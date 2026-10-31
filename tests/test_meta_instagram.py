@@ -6,6 +6,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import pytest
 import httpx
@@ -16,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import app.commands.map_meta_instagram_account as mapping_command
+import app.providers.meta_instagram as meta_instagram_provider_module
 import app.routers.meta_instagram as instagram_router_module
 from app.core.config import Settings
 from app.core.permissions import RoleKey
@@ -30,16 +32,23 @@ from app.models.whatsapp import (
     WhatsAppDeliveryEvent,
     WhatsAppMessage,
 )
+from app.models.meta_instagram_oauth import MetaInstagramOAuthState
 from app.providers.meta_instagram import (
     MetaInstagramAcceptanceUnknownError,
     MetaInstagramConfigurationError,
     MetaInstagramProvider,
+    MetaInstagramOAuthError,
+    MetaInstagramOAuthToken,
     MetaInstagramRejectedError,
     MetaInstagramResult,
     get_meta_instagram_provider,
     safe_instagram_error,
 )
-from app.services.meta_instagram_service import process_instagram_webhook_payload
+from app.services.meta_instagram_service import (
+    process_instagram_webhook_payload,
+    provider_for_channel,
+)
+from app.utils.credential_encryption import decrypt_credential, encrypt_credential
 from tests.test_outbound_messages import setup
 
 
@@ -51,6 +60,7 @@ TEST_OTHER_ACCOUNT_ID = "9000000000000303"
 class MockInstagramProvider:
     configuration_id = TEST_CONFIGURATION_ID
     account_id = TEST_ACCOUNT_ID
+    graph_api_version = "v26.0"
     app_secret_source = "test"
     webhook_configured = True
     send_api_configured = True
@@ -76,6 +86,43 @@ class MockInstagramProvider:
             message_id="mid.ig.outbound.api.001",
             recipient_id=to,
         )
+
+
+class MockInstagramOAuthProvider(MockInstagramProvider):
+    oauth_configured = True
+    oauth_redirect_uri = (
+        "https://api.example.test/api/integrations/meta/instagram/oauth/callback"
+    )
+
+    def __init__(self, *, assignment_error: Exception | None = None) -> None:
+        super().__init__()
+        self.assignment_error = assignment_error
+        self.exchanged_codes: list[str] = []
+        self.verified_tokens: list[str] = []
+
+    def authorization_url(self, *, state: str) -> str:
+        return "https://www.facebook.com/dialog/oauth?" + urlencode(
+            {
+                "client_id": "9000000000000505",
+                "config_id": self.configuration_id,
+                "redirect_uri": self.oauth_redirect_uri,
+                "response_type": "code",
+                "state": state,
+            }
+        )
+
+    async def exchange_code(self, code: str) -> MetaInstagramOAuthToken:
+        self.exchanged_codes.append(code)
+        return MetaInstagramOAuthToken(
+            access_token="fixture-connected-system-user-token",
+            token_type="bearer",
+            expires_in=None,
+        )
+
+    async def verify_account_access(self, access_token: str) -> None:
+        self.verified_tokens.append(access_token)
+        if self.assignment_error is not None:
+            raise self.assignment_error
 
 
 def _channel(
@@ -345,6 +392,267 @@ def test_process_environment_overrides_dotenv_instagram_values(
 
     assert configured.meta_instagram_config_id == TEST_CONFIGURATION_ID
     assert configured.meta_instagram_account_id == TEST_ACCOUNT_ID
+
+
+def test_unified_login_oauth_connect_stores_verified_token_encrypted(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    provider = MockInstagramOAuthProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        initiated = client.post(
+            "/api/messages/meta/instagram/connect/initiate",
+            headers=headers,
+        )
+        assert initiated.status_code == 200, initiated.text
+        authorization_url = initiated.json()["data"]["authorization_url"]
+        query = parse_qs(urlparse(authorization_url).query)
+        state = query["state"][0]
+        assert query["config_id"] == [TEST_CONFIGURATION_ID]
+        assert query["redirect_uri"] == [provider.oauth_redirect_uri]
+        assert "access_token" not in authorization_url
+
+        callback = client.get(
+            "/api/integrations/meta/instagram/oauth/callback",
+            params={"state": state, "code": "fixture-authorization-code"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert callback.status_code == 200, callback.text
+    assert callback.json()["data"]["account_id"] == TEST_ACCOUNT_ID
+    assert provider.exchanged_codes == ["fixture-authorization-code"]
+    assert provider.verified_tokens == ["fixture-connected-system-user-token"]
+    database_session.expire_all()
+    stored_channel = database_session.get(WhatsAppChannel, channel.id)
+    assert stored_channel is not None
+    assert stored_channel.credential_ciphertext
+    assert (
+        decrypt_credential(stored_channel.credential_ciphertext)
+        == "fixture-connected-system-user-token"
+    )
+    state_record = database_session.scalar(select(MetaInstagramOAuthState))
+    assert state_record is not None and state_record.used_at is not None
+    assert state not in state_record.state_hash
+
+
+def test_unified_login_oauth_rejects_invalid_state_without_exchange(
+    client: TestClient,
+) -> None:
+    provider = MockInstagramOAuthProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        response = client.get(
+            "/api/integrations/meta/instagram/oauth/callback",
+            params={"state": "invalid-state-value", "code": "unused-code"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_oauth_state"
+    assert provider.exchanged_codes == []
+
+
+def test_unified_login_oauth_initiation_requires_integration_management(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(
+        client,
+        database_session,
+        role_key=RoleKey.OPERATOR,
+    )
+    _channel(database_session, tenant.id)
+    provider = MockInstagramOAuthProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        response = client.post(
+            "/api/messages/meta/instagram/connect/initiate",
+            headers=headers,
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert response.status_code == 403
+
+
+def test_unified_login_oauth_does_not_store_unassigned_token(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    provider = MockInstagramOAuthProvider(
+        assignment_error=MetaInstagramOAuthError(
+            code="instagram_account_not_assigned",
+            safe_message=(
+                "The configured Instagram professional account was not shared "
+                "during Unified Login"
+            ),
+            http_status=403,
+        )
+    )
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        initiated = client.post(
+            "/api/messages/meta/instagram/connect/initiate",
+            headers=headers,
+        )
+        state = parse_qs(
+            urlparse(initiated.json()["data"]["authorization_url"]).query
+        )["state"][0]
+        response = client.get(
+            "/api/integrations/meta/instagram/oauth/callback",
+            params={"state": state, "code": "fixture-authorization-code"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "instagram_account_not_assigned"
+    database_session.expire_all()
+    stored_channel = database_session.get(WhatsAppChannel, channel.id)
+    assert stored_channel is not None
+    assert stored_channel.credential_ciphertext is None
+
+
+def test_connected_channel_token_overrides_environment_token() -> None:
+    provider = MetaInstagramProvider(
+        SimpleNamespace(
+            meta_instagram_config_id=TEST_CONFIGURATION_ID,
+            meta_instagram_app_id="9000000000000505",
+            meta_instagram_account_id=TEST_ACCOUNT_ID,
+            meta_instagram_access_token=SecretStr("fixture-environment-token"),
+            meta_instagram_verify_token=SecretStr("fixture-verify-token"),
+            meta_instagram_app_secret=SecretStr("fixture-app-secret"),
+            meta_instagram_oauth_redirect_uri=(
+                "https://api.example.test/api/integrations/meta/instagram/oauth/callback"
+            ),
+            meta_graph_api_version="v26.0",
+            meta_instagram_timeout_seconds=12.0,
+        )
+    )
+    channel = SimpleNamespace(
+        credential_ciphertext=encrypt_credential("fixture-connected-token")
+    )
+
+    selected = provider_for_channel(provider, channel)
+
+    assert selected.access_token == "fixture-connected-token"
+    assert provider.access_token == "fixture-environment-token"
+
+
+@pytest.mark.parametrize(
+    ("token_type", "expected_error"),
+    [("SYSTEM_USER", None), ("USER", "oauth_token_type_incompatible")],
+)
+def test_oauth_provider_validates_token_type_app_scopes_and_account(
+    monkeypatch,
+    token_type: str,
+    expected_error: str | None,
+) -> None:
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, document: dict) -> None:
+            self.document = document
+
+        def json(self) -> dict:
+            return self.document
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def get(self, url: str, **kwargs):
+            del kwargs
+            if url.endswith("/debug_token"):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "is_valid": True,
+                            "app_id": "9000000000000505",
+                            "type": token_type,
+                            "scopes": [
+                                "instagram_basic",
+                                "instagram_manage_messages",
+                            ],
+                        }
+                    }
+                )
+            if url.endswith("/me/assigned_instagram_accounts"):
+                return FakeResponse({"data": [{"id": TEST_ACCOUNT_ID}]})
+            return FakeResponse({"id": TEST_ACCOUNT_ID, "username": "fixture_account"})
+
+    monkeypatch.setattr(meta_instagram_provider_module.httpx, "AsyncClient", FakeClient)
+    provider = MetaInstagramProvider(
+        SimpleNamespace(
+            meta_instagram_config_id=TEST_CONFIGURATION_ID,
+            meta_instagram_app_id="9000000000000505",
+            meta_instagram_account_id=TEST_ACCOUNT_ID,
+            meta_instagram_access_token=SecretStr("fixture-environment-token"),
+            meta_instagram_verify_token=SecretStr("fixture-verify-token"),
+            meta_instagram_app_secret=SecretStr("fixture-app-secret"),
+            meta_instagram_oauth_redirect_uri=(
+                "https://api.example.test/api/integrations/meta/instagram/oauth/callback"
+            ),
+            meta_graph_api_version="v26.0",
+            meta_instagram_timeout_seconds=12.0,
+        )
+    )
+
+    if expected_error is None:
+        asyncio.run(provider.verify_account_access("fixture-connected-token"))
+    else:
+        with pytest.raises(MetaInstagramOAuthError) as captured:
+            asyncio.run(provider.verify_account_access("fixture-connected-token"))
+        assert captured.value.code == expected_error
+
+
+def test_oauth_callback_query_secrets_are_redacted() -> None:
+    captured: dict[str, object] = {}
+
+    async def downstream(scope, receive, send):
+        del receive
+        captured["query_string"] = scope["query_string"]
+        captured["oauth"] = scope.get("state", {}).get(
+            "meta_instagram_oauth_query"
+        )
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    middleware = SensitiveQueryRedactionMiddleware(downstream)
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/integrations/meta/instagram/oauth/callback",
+        "query_string": b"state=secret-state&code=secret-code",
+        "state": {},
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        del message
+
+    asyncio.run(middleware(scope, receive, send))
+    assert b"secret-state" not in captured["query_string"]
+    assert b"secret-code" not in captured["query_string"]
+    assert captured["oauth"] == {
+        "state": "secret-state",
+        "code": "secret-code",
+    }
 
 
 def test_meta_account_access_error_retains_subcode_and_safe_reason() -> None:

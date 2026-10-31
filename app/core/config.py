@@ -111,10 +111,13 @@ class Settings(BaseSettings):
     meta_messenger_profile_refresh_rate_limit_requests: int = Field(default=5, ge=1, le=60)
     meta_messenger_profile_refresh_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
     meta_instagram_config_id: str | None = None
+    meta_instagram_app_id: str | None = None
     meta_instagram_account_id: str | None = None
     meta_instagram_access_token: SecretStr | None = None
     meta_instagram_verify_token: SecretStr | None = None
     meta_instagram_app_secret: SecretStr | None = None
+    meta_instagram_oauth_redirect_uri: str | None = None
+    meta_instagram_oauth_state_expire_minutes: int = Field(default=10, ge=5, le=30)
     meta_instagram_timeout_seconds: float = Field(default=20.0, ge=1.0, le=120.0)
     meta_instagram_reply_rate_limit_requests: int = Field(default=30, ge=1, le=300)
     meta_instagram_reply_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)

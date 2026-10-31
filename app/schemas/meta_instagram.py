@@ -21,6 +21,30 @@ class InstagramChannelResponse(BaseModel):
     data: InstagramChannelData
 
 
+class InstagramOAuthStartData(BaseModel):
+    authorization_url: str
+    expires_at: datetime
+
+
+class InstagramOAuthStartResponse(BaseModel):
+    success: bool = True
+    message: str = "Instagram authorization started"
+    data: InstagramOAuthStartData
+
+
+class InstagramOAuthCallbackData(BaseModel):
+    workspace_id: uuid.UUID
+    channel_id: uuid.UUID
+    account_id: str
+    connected: bool = True
+
+
+class InstagramOAuthCallbackResponse(BaseModel):
+    success: bool = True
+    message: str = "Instagram account authorization completed"
+    data: InstagramOAuthCallbackData
+
+
 class InstagramBlockingReason(BaseModel):
     code: str
     message: str

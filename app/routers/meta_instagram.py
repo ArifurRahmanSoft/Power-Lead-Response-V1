@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.permissions import PermissionKey
 from app.core.security import WorkspaceContext, require_permission
@@ -29,6 +30,10 @@ from app.schemas.meta_instagram import (
     InstagramMessageData,
     InstagramMessagePageData,
     InstagramMessagePageResponse,
+    InstagramOAuthCallbackData,
+    InstagramOAuthCallbackResponse,
+    InstagramOAuthStartData,
+    InstagramOAuthStartResponse,
     InstagramReadData,
     InstagramReadResponse,
     InstagramRecoveryData,
@@ -36,6 +41,11 @@ from app.schemas.meta_instagram import (
     InstagramReplyData,
     InstagramReplyRequest,
     InstagramReplyResponse,
+)
+from app.services.meta_instagram_oauth_service import (
+    MetaInstagramOAuthStateError,
+    begin_instagram_oauth,
+    complete_instagram_oauth,
 )
 from app.services.meta_instagram_service import (
     MetaInstagramChannelNotConfiguredError,
@@ -64,6 +74,7 @@ from app.services.whatsapp_service import conversation_contact_name
 
 router = APIRouter()
 webhook_router = APIRouter()
+oauth_router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
@@ -168,8 +179,84 @@ def get_channel(
             account_id=channel.provider_channel_id or "",
             account_display_name=account_display_name(channel),
             configuration_id=provider.configuration_id or None,
-            ready=provider.send_api_configured,
+            ready=provider.send_api_configured or bool(channel.credential_ciphertext),
             active=channel.is_active,
+        )
+    )
+
+
+@router.post("/connect/initiate", response_model=InstagramOAuthStartResponse)
+def initiate_instagram_connection(
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    provider: Annotated[MetaInstagramProvider, Depends(get_meta_instagram_provider)],
+) -> InstagramOAuthStartResponse:
+    try:
+        result = begin_instagram_oauth(
+            database_session,
+            context,
+            provider,
+            expire_minutes=settings.meta_instagram_oauth_state_expire_minutes,
+        )
+    except MetaInstagramError as exception:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exception.code, "message": exception.safe_message},
+        ) from exception
+    return InstagramOAuthStartResponse(
+        data=InstagramOAuthStartData(
+            authorization_url=result.authorization_url,
+            expires_at=result.expires_at,
+        )
+    )
+
+
+@oauth_router.get(
+    "/api/integrations/meta/instagram/oauth/callback",
+    response_model=InstagramOAuthCallbackResponse,
+)
+async def instagram_oauth_callback(
+    request: Request,
+    database_session: Annotated[Session, Depends(get_db)],
+    provider: Annotated[MetaInstagramProvider, Depends(get_meta_instagram_provider)],
+    state: str | None = None,
+    code: str | None = None,
+    error: str | None = None,
+) -> InstagramOAuthCallbackResponse:
+    original = getattr(request.state, "meta_instagram_oauth_query", {})
+    supplied_state = str(original.get("state", state or ""))
+    supplied_code = original.get("code", code)
+    supplied_error = original.get("error", error)
+    try:
+        result = await complete_instagram_oauth(
+            database_session,
+            provider,
+            state=supplied_state,
+            code=str(supplied_code) if supplied_code is not None else None,
+            provider_error=(
+                str(supplied_error) if supplied_error is not None else None
+            ),
+        )
+    except MetaInstagramOAuthStateError as exception:
+        database_session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exception.code, "message": exception.message},
+        ) from exception
+    except MetaInstagramError as exception:
+        database_session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exception.code, "message": exception.safe_message},
+        ) from exception
+    return InstagramOAuthCallbackResponse(
+        data=InstagramOAuthCallbackData(
+            workspace_id=result.tenant_id,
+            channel_id=result.channel_id,
+            account_id=result.account_id,
         )
     )
 
