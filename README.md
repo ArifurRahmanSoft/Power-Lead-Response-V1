@@ -1547,3 +1547,49 @@ does not use message tags, `HUMAN_AGENT`, cold outreach, bulk sending or
 `mark_seen`. Provider acceptance is stored as `accepted`, not delivered/read.
 Use the GET-only recovery endpoint after a browser timeout; it never calls Meta
 or retries an unknown outcome.
+
+## Meta Instagram configuration
+
+Instagram API with Unified Login configuration is loaded only through
+`app.core.config.Settings`. Local development reads `.env`; a deployed Render
+process supplies the same names as process environment variables. Pydantic
+Settings gives process variables precedence over `.env` values.
+
+Required Instagram variables:
+
+- `META_INSTAGRAM_CONFIG_ID`: Unified Login configuration ID from Meta App Dashboard.
+- `META_INSTAGRAM_ACCOUNT_ID`: Instagram Professional Account ID assigned to the token.
+- `META_INSTAGRAM_ACCESS_TOKEN`: server-only Business Integration System User token.
+- `META_INSTAGRAM_VERIFY_TOKEN`: private webhook challenge token.
+- `META_INSTAGRAM_APP_SECRET`: Instagram app secret for webhook signature validation.
+- `META_GRAPH_API_VERSION`: shared supported Meta Graph API version.
+
+Never commit real IDs or secrets to `.env.example`. Missing account/token settings
+leave sending unavailable, and missing webhook settings cause safe webhook rejection.
+
+Map the account currently selected by `META_INSTAGRAM_ACCOUNT_ID`:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.commands.map_meta_instagram_account `
+  --workspace-slug <workspace-slug>
+```
+
+Preview a mapping correction from an explicitly identified old account to the account
+currently selected by `META_INSTAGRAM_ACCOUNT_ID` (the default is read-only):
+
+```powershell
+.\.venv\Scripts\python.exe -m app.commands.correct_meta_instagram_account `
+  --workspace-slug <workspace-slug> `
+  --old-account-id <old-instagram-account-id>
+```
+
+After reviewing the dry-run result, apply it explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m app.commands.correct_meta_instagram_account `
+  --workspace-slug <workspace-slug> `
+  --old-account-id <old-instagram-account-id> `
+  --apply
+```
+
+Neither command runs during application startup.

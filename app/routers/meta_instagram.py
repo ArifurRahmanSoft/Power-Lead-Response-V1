@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 from typing import Annotated
 
@@ -63,6 +64,7 @@ from app.services.whatsapp_service import conversation_contact_name
 
 router = APIRouter()
 webhook_router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _message_data(message: WhatsAppMessage) -> InstagramMessageData:
@@ -394,6 +396,9 @@ def verify_instagram_webhook(
         raise HTTPException(status_code=503, detail="Meta Instagram webhook is not configured")
     supplied_token = getattr(request.state, "meta_webhook_verify_token", verify_token)
     if not provider.validate_challenge(mode=mode, verify_token=supplied_token):
+        logger.warning(
+            "meta_instagram_webhook_rejected reason_code=verification_challenge_invalid"
+        )
         raise HTTPException(status_code=403, detail="Invalid Meta Instagram webhook verification")
     return Response(content=challenge, media_type="text/plain")
 
@@ -405,10 +410,14 @@ async def receive_instagram_webhook(
     provider: Annotated[MetaInstagramProvider, Depends(get_meta_instagram_provider)],
 ) -> Response:
     raw_body = await request.body()
-    if not provider.validate_signature(
-        raw_body,
-        request.headers.get("X-Hub-Signature-256", ""),
-    ):
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not provider.validate_signature(raw_body, signature):
+        reason_code = "signature_missing" if not signature else "signature_invalid"
+        logger.warning(
+            "meta_instagram_webhook_rejected reason_code=%s app_secret_source=%s",
+            reason_code,
+            provider.app_secret_source,
+        )
         raise HTTPException(status_code=403, detail="Invalid Meta Instagram webhook signature")
     try:
         payload = json.loads(raw_body)
@@ -420,6 +429,10 @@ async def receive_instagram_webhook(
         process_instagram_webhook_payload(database_session, provider, payload)
     except MetaInstagramWebhookRejectedError as exception:
         database_session.rollback()
+        logger.warning(
+            "meta_instagram_webhook_rejected reason_code=%s",
+            exception.reason_code,
+        )
         raise HTTPException(status_code=403, detail="Unknown Meta Instagram account channel") from exception
     except MetaInstagramPayloadError as exception:
         database_session.rollback()

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 
 import app.commands.map_meta_instagram_account as mapping_command
 import app.routers.meta_instagram as instagram_router_module
+from app.core.config import Settings
 from app.core.permissions import RoleKey
 from app.core.sensitive_query import SensitiveQueryRedactionMiddleware
 from app.main import app
@@ -30,18 +32,26 @@ from app.models.whatsapp import (
 )
 from app.providers.meta_instagram import (
     MetaInstagramAcceptanceUnknownError,
+    MetaInstagramConfigurationError,
     MetaInstagramProvider,
     MetaInstagramRejectedError,
     MetaInstagramResult,
     get_meta_instagram_provider,
+    safe_instagram_error,
 )
 from app.services.meta_instagram_service import process_instagram_webhook_payload
 from tests.test_outbound_messages import setup
 
 
+TEST_CONFIGURATION_ID = "9000000000000101"
+TEST_ACCOUNT_ID = "9000000000000202"
+TEST_OTHER_ACCOUNT_ID = "9000000000000303"
+
+
 class MockInstagramProvider:
-    configuration_id = "1392416376006210"
-    account_id = "17841400000000001"
+    configuration_id = TEST_CONFIGURATION_ID
+    account_id = TEST_ACCOUNT_ID
+    app_secret_source = "test"
     webhook_configured = True
     send_api_configured = True
 
@@ -232,7 +242,7 @@ def test_challenge_invalid_values_and_query_token_redaction(client: TestClient) 
     assert captured["token"] == "secret-value"
 
 
-def test_signature_validation_and_shared_app_secret_fallback() -> None:
+def test_signature_validation_requires_instagram_app_secret() -> None:
     provider = MetaInstagramProvider.__new__(MetaInstagramProvider)
     provider.app_secret = "test-instagram-secret"
     body = b'{"object":"instagram"}'
@@ -249,7 +259,7 @@ def test_signature_validation_and_shared_app_secret_fallback() -> None:
         "meta_graph_api_version": "v26.0",
         "meta_instagram_timeout_seconds": 20.0,
     }
-    shared = MetaInstagramProvider(
+    missing_instagram_secret = MetaInstagramProvider(
         SimpleNamespace(**common, meta_instagram_app_secret=None)
     )
     separate = MetaInstagramProvider(
@@ -258,9 +268,174 @@ def test_signature_validation_and_shared_app_secret_fallback() -> None:
             meta_instagram_app_secret=SecretStr("separate-secret"),
         )
     )
-    assert shared.app_secret == "shared-secret"
+    assert missing_instagram_secret.app_secret == ""
+    assert missing_instagram_secret.app_secret_source == "missing"
+    assert missing_instagram_secret.webhook_configured is False
     assert separate.app_secret == "separate-secret"
-    assert shared.base_url == "https://graph.facebook.com/v26.0"
+    assert separate.app_secret_source == "META_INSTAGRAM_APP_SECRET"
+    assert separate.base_url == "https://graph.facebook.com/v26.0"
+
+
+def test_provider_uses_injected_central_instagram_settings() -> None:
+    configured = MetaInstagramProvider(
+        SimpleNamespace(
+            meta_instagram_config_id=TEST_CONFIGURATION_ID,
+            meta_instagram_account_id=TEST_ACCOUNT_ID,
+            meta_instagram_access_token=SecretStr("fixture-access-token"),
+            meta_instagram_verify_token=SecretStr("fixture-verify-token"),
+            meta_instagram_app_secret=SecretStr("fixture-app-secret"),
+            meta_app_secret=None,
+            meta_graph_api_version="v26.0",
+            meta_instagram_timeout_seconds=12.0,
+        )
+    )
+
+    assert configured.configuration_id == TEST_CONFIGURATION_ID
+    assert configured.account_id == TEST_ACCOUNT_ID
+    assert configured.base_url == "https://graph.facebook.com/v26.0"
+    assert configured.webhook_configured is True
+    assert configured.send_api_configured is True
+
+
+def test_missing_instagram_settings_fail_safely_without_real_fallbacks() -> None:
+    missing = MetaInstagramProvider(
+        SimpleNamespace(
+            meta_instagram_config_id=None,
+            meta_instagram_account_id=None,
+            meta_instagram_access_token=None,
+            meta_instagram_verify_token=None,
+            meta_instagram_app_secret=None,
+            meta_app_secret=None,
+            meta_graph_api_version="v26.0",
+            meta_instagram_timeout_seconds=12.0,
+        )
+    )
+
+    assert missing.configuration_id == ""
+    assert missing.account_id == ""
+    assert missing.webhook_configured is False
+    assert missing.send_api_configured is False
+    assert Settings.model_fields["meta_instagram_config_id"].default is None
+    assert Settings.model_fields["meta_instagram_account_id"].default is None
+    with pytest.raises(MetaInstagramConfigurationError):
+        asyncio.run(missing.send_text(to="9000000000000909", body="Fixture message"))
+
+
+def test_process_environment_overrides_dotenv_instagram_values(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "LOCAL_DATABASE_URL=postgresql://fixture:fixture@localhost/local_fixture",
+                "PRODUCTION_DATABASE_URL=postgresql://fixture:fixture@localhost/live_fixture",
+                "JWT_SECRET_KEY=fixture-jwt-secret-that-is-at-least-32-characters",
+                "META_INSTAGRAM_CONFIG_ID=9000000000000707",
+                "META_INSTAGRAM_ACCOUNT_ID=9000000000000808",
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("META_INSTAGRAM_CONFIG_ID", TEST_CONFIGURATION_ID)
+    monkeypatch.setenv("META_INSTAGRAM_ACCOUNT_ID", TEST_ACCOUNT_ID)
+
+    configured = Settings(_env_file=env_file)
+
+    assert configured.meta_instagram_config_id == TEST_CONFIGURATION_ID
+    assert configured.meta_instagram_account_id == TEST_ACCOUNT_ID
+
+
+def test_meta_account_access_error_retains_subcode_and_safe_reason() -> None:
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://graph.facebook.com/v26.0/account/messages"),
+        json={
+            "error": {
+                "message": "provider text that must not be exposed",
+                "type": "GraphMethodException",
+                "code": 100,
+                "error_subcode": 33,
+            }
+        },
+    )
+    error = MetaInstagramProvider._provider_error(response)
+    assert error.http_status == 400
+    assert error.code == "100:33"
+    assert error.safe_message == safe_instagram_error("100:33")
+    assert "provider text" not in error.safe_message
+
+
+def test_meta_account_access_error_is_safely_persisted(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    conversation = _conversation(database_session, tenant.id, channel)
+    provider = MockInstagramProvider(
+        error=MetaInstagramRejectedError(
+            code="100:33",
+            safe_message=safe_instagram_error("100:33"),
+            http_status=400,
+        )
+    )
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        response = client.post(
+            f"/api/messages/meta/instagram/conversations/{conversation.id}/reply",
+            headers=headers,
+            json={
+                "text": "Reply",
+                "idempotency_key": "ig-account-access-failure",
+            },
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+    assert response.status_code == 200
+    message = response.json()["data"]["message"]
+    assert message["status"] == "failed"
+    assert message["provider_error_code"] == "100:33"
+    assert message["failure_reason"] == safe_instagram_error("100:33")
+    assert "provider text" not in response.text
+
+
+def test_webhook_403_reason_logging_is_sanitized(
+    client: TestClient,
+    database_session: Session,
+    caplog,
+) -> None:
+    setup(client, database_session)
+    provider = MockInstagramProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    payload = _payload(_message_event())
+    try:
+        missing_signature = client.post(
+            "/api/webhooks/meta/instagram",
+            content=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        invalid_signature = _post(client, payload, signature="sha256=not-valid")
+        account_mismatch = _post(
+            client,
+            _payload(_message_event(), account_id=TEST_OTHER_ACCOUNT_ID),
+        )
+        unmapped = _post(client, payload)
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert missing_signature.status_code == 403
+    assert invalid_signature.status_code == 403
+    assert account_mismatch.status_code == 403
+    assert unmapped.status_code == 403
+    logged = caplog.text
+    assert "reason_code=signature_missing" in logged
+    assert "reason_code=signature_invalid" in logged
+    assert "reason_code=account_id_mismatch" in logged
+    assert "reason_code=account_channel_not_mapped" in logged
+    assert "sha256=not-valid" not in logged
+    assert json.dumps(payload) not in logged
 
 
 def test_webhook_dedup_account_isolation_echo_read_and_safe_media(
@@ -298,7 +473,7 @@ def test_webhook_dedup_account_isolation_echo_read_and_safe_media(
         invalid_signature = _post(client, _payload(inbound), "sha256=invalid")
         first = _post(client, _payload(inbound, attachment, echo, read, unsupported))
         duplicate = _post(client, _payload(inbound, attachment, echo, read, unsupported))
-        unknown = _post(client, _payload(inbound, account_id="17841499999999999"))
+        unknown = _post(client, _payload(inbound, account_id=TEST_OTHER_ACCOUNT_ID))
     finally:
         app.dependency_overrides.pop(get_meta_instagram_provider, None)
 
@@ -553,7 +728,7 @@ def test_tenant_record_scope_and_mapping_command(
     other_channel = _channel(
         database_session,
         other.id,
-        account_id="17841499999999998",
+        account_id="9000000000000404",
     )
     hidden = _conversation(
         database_session,
@@ -580,7 +755,7 @@ def test_tenant_record_scope_and_mapping_command(
 
     monkeypatch.setattr(
         mapping_command,
-        "Settings",
+        "get_settings",
         lambda: SimpleNamespace(meta_instagram_account_id=MockInstagramProvider.account_id),
     )
     monkeypatch.setattr(mapping_command, "SessionLocal", TestSessionLocal)

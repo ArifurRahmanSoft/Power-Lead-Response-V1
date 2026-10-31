@@ -65,7 +65,9 @@ INSTAGRAM_REPLY_WINDOW = timedelta(hours=24)
 
 
 class MetaInstagramWebhookRejectedError(Exception):
-    pass
+    def __init__(self, reason_code: str) -> None:
+        self.reason_code = reason_code
+        super().__init__(reason_code)
 
 
 class MetaInstagramPayloadError(Exception):
@@ -679,7 +681,7 @@ def _persist_event(
         provider=INSTAGRAM_PROVIDER,
     )
     if message is not None and message.tenant_id != channel.tenant_id:
-        raise MetaInstagramWebhookRejectedError
+        raise MetaInstagramWebhookRejectedError("provider_message_tenant_mismatch")
     database_session.add(
         WhatsAppDeliveryEvent(
             tenant_id=channel.tenant_id,
@@ -716,7 +718,7 @@ def _persist_inbound_message(
     )
     if existing is not None:
         if existing.tenant_id != channel.tenant_id:
-            raise MetaInstagramWebhookRejectedError
+            raise MetaInstagramWebhookRejectedError("provider_message_tenant_mismatch")
         return "duplicate"
     occurred_at = _timestamp_ms(event.get("timestamp"))
     conversation = get_conversation_by_contact(
@@ -787,7 +789,7 @@ def _persist_outbound_echo(
     )
     if existing is not None:
         if existing.tenant_id != channel.tenant_id:
-            raise MetaInstagramWebhookRejectedError
+            raise MetaInstagramWebhookRejectedError("provider_message_tenant_mismatch")
         _persist_event(
             database_session,
             channel=channel,
@@ -893,7 +895,7 @@ def _process_messaging_event(
     if isinstance(message_payload, dict):
         if message_payload.get("is_echo") is True:
             if sender_id != account_id:
-                raise MetaInstagramWebhookRejectedError
+                raise MetaInstagramWebhookRejectedError("echo_sender_account_mismatch")
             outcome = _persist_outbound_echo(
                 database_session,
                 channel=channel,
@@ -908,7 +910,7 @@ def _process_messaging_event(
                 counts["messages"] += 1
             return
         if recipient_id != account_id:
-            raise MetaInstagramWebhookRejectedError
+            raise MetaInstagramWebhookRejectedError("message_recipient_account_mismatch")
         outcome = _persist_inbound_message(
             database_session,
             channel=channel,
@@ -920,7 +922,7 @@ def _process_messaging_event(
         counts["messages" if outcome == "created" else "duplicates"] += 1
         return
     if recipient_id != account_id:
-        raise MetaInstagramWebhookRejectedError
+        raise MetaInstagramWebhookRejectedError("read_recipient_account_mismatch")
     provider_message_id = str(read.get("mid") or "").strip()
     if not provider_message_id or len(provider_message_id) > 255:
         counts["unsupported"] += 1
@@ -945,25 +947,25 @@ def process_instagram_webhook_payload(
     _retry_on_conflict: bool = True,
 ) -> dict[str, int]:
     entries = payload.get("entry")
-    if (
-        not provider.webhook_configured
-        or payload.get("object") != "instagram"
-        or not isinstance(entries, list)
-    ):
-        raise MetaInstagramWebhookRejectedError
+    if not provider.webhook_configured:
+        raise MetaInstagramWebhookRejectedError("webhook_configuration_incomplete")
+    if payload.get("object") != "instagram":
+        raise MetaInstagramWebhookRejectedError("unexpected_webhook_object")
+    if not isinstance(entries, list):
+        raise MetaInstagramWebhookRejectedError("invalid_webhook_entries")
     counts = {"messages": 0, "events": 0, "echoes": 0, "duplicates": 0, "unsupported": 0}
     for entry in entries:
         if not isinstance(entry, dict):
             raise MetaInstagramPayloadError
         account_id = str(entry.get("id") or "").strip()
         if account_id != provider.account_id:
-            raise MetaInstagramWebhookRejectedError
+            raise MetaInstagramWebhookRejectedError("account_id_mismatch")
         channel = get_active_instagram_channel_by_account_id(
             database_session,
             account_id=account_id,
         )
         if channel is None:
-            raise MetaInstagramWebhookRejectedError
+            raise MetaInstagramWebhookRejectedError("account_channel_not_mapped")
         messaging = entry.get("messaging")
         if isinstance(messaging, list):
             for event in messaging:

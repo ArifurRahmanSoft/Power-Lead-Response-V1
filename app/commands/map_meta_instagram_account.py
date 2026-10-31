@@ -2,7 +2,7 @@ import argparse
 
 from sqlalchemy import select
 
-from app.core.config import Settings
+from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.models.tenant import Tenant
 from app.models.whatsapp import WhatsAppChannel
@@ -12,7 +12,7 @@ PROVIDER = "instagram"
 
 
 def configure_account(workspace_slug: str) -> tuple[WhatsAppChannel, bool]:
-    configuration = Settings()
+    configuration = get_settings()
     account_id = (configuration.meta_instagram_account_id or "").strip()
     if not account_id:
         raise RuntimeError("META_INSTAGRAM_ACCOUNT_ID must be configured")

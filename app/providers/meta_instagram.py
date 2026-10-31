@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.core.meta_webhook import validate_meta_challenge, validate_meta_signature
 
 
@@ -56,6 +56,14 @@ class MetaInstagramResult:
 
 def safe_instagram_error(code: object) -> str:
     normalized = str(code or "meta_rejected")
+    exact = {
+        "100:33": (
+            "The configured Meta token cannot access the Instagram professional "
+            "account; reconnect with Unified Login and share this account"
+        ),
+    }
+    if normalized in exact:
+        return exact[normalized]
     base_code = normalized.split(":", 1)[0]
     known = {
         "3": "The Meta app cannot use this Instagram messaging operation",
@@ -81,7 +89,7 @@ class MetaInstagramProvider:
     """
 
     def __init__(self, configuration: Settings | None = None) -> None:
-        config = configuration or Settings()
+        config = configuration or get_settings()
         self.configuration_id = (config.meta_instagram_config_id or "").strip()
         self.account_id = (config.meta_instagram_account_id or "").strip()
         self.access_token = (
@@ -97,7 +105,12 @@ class MetaInstagramProvider:
         self.app_secret = (
             config.meta_instagram_app_secret.get_secret_value()
             if config.meta_instagram_app_secret
-            else (config.meta_app_secret.get_secret_value() if config.meta_app_secret else "")
+            else ""
+        )
+        self.app_secret_source = (
+            "META_INSTAGRAM_APP_SECRET"
+            if config.meta_instagram_app_secret
+            else "missing"
         )
         version = (config.meta_graph_api_version or "").strip()
         self.graph_api_version = version if GRAPH_VERSION_PATTERN.fullmatch(version) else ""
@@ -114,7 +127,8 @@ class MetaInstagramProvider:
     @property
     def send_api_configured(self) -> bool:
         return bool(
-            META_OBJECT_ID_PATTERN.fullmatch(self.account_id)
+            META_OBJECT_ID_PATTERN.fullmatch(self.configuration_id)
+            and META_OBJECT_ID_PATTERN.fullmatch(self.account_id)
             and self.access_token
             and self.graph_api_version
         )
@@ -209,4 +223,4 @@ class MetaInstagramProvider:
 
 
 def get_meta_instagram_provider() -> MetaInstagramProvider:
-    return MetaInstagramProvider(Settings())
+    return MetaInstagramProvider(get_settings())
