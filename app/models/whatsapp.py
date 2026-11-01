@@ -202,6 +202,7 @@ class WhatsAppMessage(Base):
     recipient_address: Mapped[str] = mapped_column(String(32), nullable=False)
     provider_message_sid: Mapped[str | None] = mapped_column(String(255), nullable=True)
     provider_error_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    provider_http_status: Mapped[int | None] = mapped_column(nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
     submission_state: Mapped[str] = mapped_column(String(20), nullable=False)

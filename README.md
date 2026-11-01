@@ -1583,6 +1583,19 @@ token on the tenant channel using `SMTP_CREDENTIAL_ENCRYPTION_KEY`. Codes, state
 tokens are never returned or written to access logs. Run migration
 `b7e2c41d8f90` before using this flow.
 
+Authorized integration administrators can inspect the exact credential selected by
+the reply path without exposing it:
+
+```text
+GET /api/messages/meta/instagram/diagnostics/readiness
+```
+
+The diagnostic requires `settings.integrations.view`, performs only read-only Meta
+requests, and reports `channel_encrypted` or `environment` plus safe readiness
+booleans and reason codes. A stored channel token always takes precedence. If it
+cannot be decrypted or validated, the application does not fall back to the
+environment token.
+
 Never commit real IDs or secrets to `.env.example`. Missing account/token settings
 leave sending unavailable, and missing webhook settings cause safe webhook rejection.
 

@@ -67,6 +67,18 @@ class MetaInstagramOAuthToken:
     expires_in: int | None
 
 
+@dataclass(frozen=True)
+class MetaInstagramCredentialDiagnostic:
+    token_valid: bool | None
+    token_type: str | None
+    issuing_app_matches: bool | None
+    required_scopes_granted: bool | None
+    configured_account_assigned: bool | None
+    configured_account_accessible: bool | None
+    reason_code: str | None = None
+    provider_http_status: int | None = None
+
+
 def safe_instagram_error(code: object) -> str:
     normalized = str(code or "meta_rejected")
     exact = {
@@ -232,7 +244,10 @@ class MetaInstagramProvider:
                 safe_message="Meta returned an invalid Instagram authorization response",
             ) from exception
 
-    async def verify_account_access(self, access_token: str) -> None:
+    async def inspect_account_access(
+        self,
+        access_token: str,
+    ) -> MetaInstagramCredentialDiagnostic:
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 debug_response = await client.get(
@@ -257,10 +272,15 @@ class MetaInstagramProvider:
             ) from exception
         if debug_response.status_code >= 400:
             error = self._provider_error(debug_response)
-            raise MetaInstagramOAuthError(
-                code=error.code,
-                safe_message="Meta could not validate the Instagram authorization token",
-                http_status=error.http_status,
+            return MetaInstagramCredentialDiagnostic(
+                token_valid=None,
+                token_type=None,
+                issuing_app_matches=None,
+                required_scopes_granted=None,
+                configured_account_assigned=None,
+                configured_account_accessible=None,
+                reason_code=error.code,
+                provider_http_status=error.http_status,
             )
         try:
             token_data = debug_response.json().get("data", {})
@@ -270,37 +290,39 @@ class MetaInstagramProvider:
                 code="oauth_debug_invalid_response",
                 safe_message="Meta returned an invalid token inspection response",
             ) from exception
-        if not token_data.get("is_valid"):
-            raise MetaInstagramOAuthError(
-                code="oauth_token_invalid",
-                safe_message="Meta returned an invalid Instagram authorization token",
-                http_status=403,
-            )
-        if str(token_data.get("app_id") or "") != self.app_id:
-            raise MetaInstagramOAuthError(
-                code="oauth_app_mismatch",
-                safe_message="The Instagram authorization token belongs to a different Meta app",
-                http_status=403,
-            )
-        if str(token_data.get("type") or "").upper() != "SYSTEM_USER":
-            raise MetaInstagramOAuthError(
-                code="oauth_token_type_incompatible",
-                safe_message="Meta did not return a Unified Login system-user token",
-                http_status=403,
-            )
+        token_valid = bool(token_data.get("is_valid"))
+        token_type = str(token_data.get("type") or "").upper() or None
+        issuing_app_matches = str(token_data.get("app_id") or "") == self.app_id
         required_scopes = {"instagram_basic", "instagram_manage_messages"}
-        if not required_scopes.issubset(token_scopes):
-            raise MetaInstagramOAuthError(
-                code="oauth_permissions_missing",
-                safe_message="The Instagram authorization is missing required permissions",
-                http_status=403,
-            )
+        scopes_granted = required_scopes.issubset(token_scopes)
+        for valid, reason in (
+            (token_valid, "oauth_token_invalid"),
+            (issuing_app_matches, "oauth_app_mismatch"),
+            (token_type == "SYSTEM_USER", "oauth_token_type_incompatible"),
+            (scopes_granted, "oauth_permissions_missing"),
+        ):
+            if not valid:
+                return MetaInstagramCredentialDiagnostic(
+                    token_valid=token_valid,
+                    token_type=token_type,
+                    issuing_app_matches=issuing_app_matches,
+                    required_scopes_granted=scopes_granted,
+                    configured_account_assigned=None,
+                    configured_account_accessible=None,
+                    reason_code=reason,
+                    provider_http_status=403,
+                )
         if assigned_response.status_code >= 400:
             error = self._provider_error(assigned_response)
-            raise MetaInstagramOAuthError(
-                code=error.code,
-                safe_message="The authorized Meta token cannot list assigned Instagram accounts",
-                http_status=error.http_status,
+            return MetaInstagramCredentialDiagnostic(
+                token_valid=token_valid,
+                token_type=token_type,
+                issuing_app_matches=issuing_app_matches,
+                required_scopes_granted=scopes_granted,
+                configured_account_assigned=None,
+                configured_account_accessible=None,
+                reason_code=error.code,
+                provider_http_status=error.http_status,
             )
         try:
             assigned = assigned_response.json().get("data", [])
@@ -312,21 +334,29 @@ class MetaInstagramProvider:
                 code="oauth_assignment_invalid_response",
                 safe_message="Meta returned an invalid Instagram account assignment response",
             ) from exception
-        if self.account_id not in assigned_ids:
-            raise MetaInstagramOAuthError(
-                code="instagram_account_not_assigned",
-                safe_message=(
-                    "The configured Instagram professional account was not shared "
-                    "during Unified Login"
-                ),
-                http_status=403,
+        account_assigned = self.account_id in assigned_ids
+        if not account_assigned:
+            return MetaInstagramCredentialDiagnostic(
+                token_valid=token_valid,
+                token_type=token_type,
+                issuing_app_matches=issuing_app_matches,
+                required_scopes_granted=scopes_granted,
+                configured_account_assigned=False,
+                configured_account_accessible=False,
+                reason_code="instagram_account_not_assigned",
+                provider_http_status=403,
             )
         if account_response.status_code >= 400:
             error = self._provider_error(account_response)
-            raise MetaInstagramOAuthError(
-                code=error.code,
-                safe_message="The authorized Meta token cannot access the configured Instagram account",
-                http_status=error.http_status,
+            return MetaInstagramCredentialDiagnostic(
+                token_valid=token_valid,
+                token_type=token_type,
+                issuing_app_matches=issuing_app_matches,
+                required_scopes_granted=scopes_granted,
+                configured_account_assigned=True,
+                configured_account_accessible=False,
+                reason_code=error.code,
+                provider_http_status=error.http_status,
             )
         try:
             account_document = account_response.json()
@@ -335,12 +365,49 @@ class MetaInstagramProvider:
                 code="oauth_account_invalid_response",
                 safe_message="Meta returned an invalid Instagram account response",
             ) from exception
-        if str(account_document.get("id") or "") != self.account_id:
-            raise MetaInstagramOAuthError(
-                code="instagram_account_mismatch",
-                safe_message="Meta authorized a different Instagram professional account",
-                http_status=403,
-            )
+        account_accessible = str(account_document.get("id") or "") == self.account_id
+        return MetaInstagramCredentialDiagnostic(
+            token_valid=token_valid,
+            token_type=token_type,
+            issuing_app_matches=issuing_app_matches,
+            required_scopes_granted=scopes_granted,
+            configured_account_assigned=True,
+            configured_account_accessible=account_accessible,
+            reason_code=None if account_accessible else "instagram_account_mismatch",
+            provider_http_status=None if account_accessible else 403,
+        )
+
+    async def verify_account_access(self, access_token: str) -> None:
+        result = await self.inspect_account_access(access_token)
+        if result.reason_code is None:
+            return
+        safe_messages = {
+            "oauth_token_invalid": "Meta returned an invalid Instagram authorization token",
+            "oauth_app_mismatch": (
+                "The Instagram authorization token belongs to a different Meta app"
+            ),
+            "oauth_token_type_incompatible": (
+                "Meta did not return a Unified Login system-user token"
+            ),
+            "oauth_permissions_missing": (
+                "The Instagram authorization is missing required permissions"
+            ),
+            "instagram_account_not_assigned": (
+                "The configured Instagram professional account was not shared "
+                "during Unified Login"
+            ),
+            "instagram_account_mismatch": (
+                "Meta authorized a different Instagram professional account"
+            ),
+        }
+        raise MetaInstagramOAuthError(
+            code=result.reason_code,
+            safe_message=safe_messages.get(
+                result.reason_code,
+                "The authorized Meta token cannot access the configured Instagram account",
+            ),
+            http_status=result.provider_http_status,
+        )
 
     def validate_challenge(self, *, mode: str, verify_token: str) -> bool:
         return validate_meta_challenge(

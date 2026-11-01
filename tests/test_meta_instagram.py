@@ -33,9 +33,11 @@ from app.models.whatsapp import (
     WhatsAppMessage,
 )
 from app.models.meta_instagram_oauth import MetaInstagramOAuthState
+from app.models.authorization_audit import AuthorizationAudit
 from app.providers.meta_instagram import (
     MetaInstagramAcceptanceUnknownError,
     MetaInstagramConfigurationError,
+    MetaInstagramCredentialDiagnostic,
     MetaInstagramProvider,
     MetaInstagramOAuthError,
     MetaInstagramOAuthToken,
@@ -99,6 +101,14 @@ class MockInstagramOAuthProvider(MockInstagramProvider):
         self.assignment_error = assignment_error
         self.exchanged_codes: list[str] = []
         self.verified_tokens: list[str] = []
+        self.sent_access_tokens: list[str] = []
+        self.access_token = "fixture-environment-token"
+
+    def with_access_token(self, access_token: str):
+        selected = object.__new__(type(self))
+        selected.__dict__ = self.__dict__.copy()
+        selected.access_token = access_token
+        return selected
 
     def authorization_url(self, *, state: str) -> str:
         return "https://www.facebook.com/dialog/oauth?" + urlencode(
@@ -123,6 +133,24 @@ class MockInstagramOAuthProvider(MockInstagramProvider):
         self.verified_tokens.append(access_token)
         if self.assignment_error is not None:
             raise self.assignment_error
+
+    async def send_text(self, *, to: str, body: str) -> MetaInstagramResult:
+        self.sent_access_tokens.append(self.access_token)
+        return await super().send_text(to=to, body=body)
+
+    async def inspect_account_access(
+        self,
+        access_token: str,
+    ) -> MetaInstagramCredentialDiagnostic:
+        del access_token
+        return MetaInstagramCredentialDiagnostic(
+            token_valid=True,
+            token_type="SYSTEM_USER",
+            issuing_app_matches=True,
+            required_scopes_granted=True,
+            configured_account_assigned=True,
+            configured_account_accessible=True,
+        )
 
 
 def _channel(
@@ -400,6 +428,7 @@ def test_unified_login_oauth_connect_stores_verified_token_encrypted(
 ) -> None:
     tenant, _, _, _, _, _, headers = setup(client, database_session)
     channel = _channel(database_session, tenant.id)
+    conversation = _conversation(database_session, tenant.id, channel)
     provider = MockInstagramOAuthProvider()
     app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
     try:
@@ -419,13 +448,20 @@ def test_unified_login_oauth_connect_stores_verified_token_encrypted(
             "/api/integrations/meta/instagram/oauth/callback",
             params={"state": state, "code": "fixture-authorization-code"},
         )
+        reply = client.post(
+            f"/api/messages/meta/instagram/conversations/{conversation.id}/reply",
+            headers=headers,
+            json={"text": "Connected reply", "idempotency_key": "connected-reply-001"},
+        )
     finally:
         app.dependency_overrides.pop(get_meta_instagram_provider, None)
 
     assert callback.status_code == 200, callback.text
+    assert reply.status_code == 200, reply.text
     assert callback.json()["data"]["account_id"] == TEST_ACCOUNT_ID
     assert provider.exchanged_codes == ["fixture-authorization-code"]
     assert provider.verified_tokens == ["fixture-connected-system-user-token"]
+    assert provider.sent_access_tokens == ["fixture-connected-system-user-token"]
     database_session.expire_all()
     stored_channel = database_session.get(WhatsAppChannel, channel.id)
     assert stored_channel is not None
@@ -480,6 +516,63 @@ def test_unified_login_oauth_initiation_requires_integration_management(
     assert response.status_code == 403
 
 
+def test_oauth_initiation_cannot_use_another_workspace_channel(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    other = Tenant(name="Other OAuth Workspace", slug=f"other-{uuid.uuid4().hex[:8]}")
+    database_session.add(other)
+    database_session.flush()
+    _channel(database_session, other.id)
+    provider = MockInstagramOAuthProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        response = client.post(
+            "/api/messages/meta/instagram/connect/initiate",
+            headers=headers,
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert tenant.id != other.id
+    assert response.status_code == 503
+    assert database_session.scalar(select(MetaInstagramOAuthState)) is None
+
+
+def test_readiness_reports_effective_source_and_never_falls_back_on_bad_ciphertext(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    provider = MockInstagramOAuthProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        environment = client.get(
+            "/api/messages/meta/instagram/diagnostics/readiness",
+            headers=headers,
+        )
+        channel.credential_ciphertext = "not-a-valid-fernet-token"
+        database_session.commit()
+        encrypted_failure = client.get(
+            "/api/messages/meta/instagram/diagnostics/readiness",
+            headers=headers,
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert environment.status_code == 200
+    environment_data = environment.json()["data"]
+    assert environment_data["credential_source"] == "environment"
+    assert environment_data["ready"] is True
+    failure_data = encrypted_failure.json()["data"]
+    assert failure_data["credential_source"] == "channel_encrypted"
+    assert failure_data["channel_credential_present"] is True
+    assert failure_data["ready"] is False
+    assert failure_data["reason_code"] == "meta_instagram_not_configured"
+
+
 def test_unified_login_oauth_does_not_store_unassigned_token(
     client: TestClient,
     database_session: Session,
@@ -518,6 +611,14 @@ def test_unified_login_oauth_does_not_store_unassigned_token(
     stored_channel = database_session.get(WhatsAppChannel, channel.id)
     assert stored_channel is not None
     assert stored_channel.credential_ciphertext is None
+    failure_audit = database_session.scalar(
+        select(AuthorizationAudit).where(
+            AuthorizationAudit.action == "meta_instagram.oauth.failed"
+        )
+    )
+    assert failure_audit is not None
+    assert failure_audit.details["stage"] == "account_verification"
+    assert failure_audit.details["reason_code"] == "instagram_account_not_assigned"
 
 
 def test_connected_channel_token_overrides_environment_token() -> None:
@@ -705,6 +806,7 @@ def test_meta_account_access_error_is_safely_persisted(
     message = response.json()["data"]["message"]
     assert message["status"] == "failed"
     assert message["provider_error_code"] == "100:33"
+    assert message["provider_http_status"] == 400
     assert message["failure_reason"] == safe_instagram_error("100:33")
     assert "provider text" not in response.text
 

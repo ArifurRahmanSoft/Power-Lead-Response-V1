@@ -45,6 +45,26 @@ class InstagramOAuthCallbackResponse(BaseModel):
     data: InstagramOAuthCallbackData
 
 
+class InstagramCredentialDiagnosticData(BaseModel):
+    credential_source: Literal["channel_encrypted", "environment"]
+    channel_credential_present: bool
+    token_valid: bool | None
+    token_type: str | None
+    issuing_app_matches: bool | None
+    required_scopes_granted: bool | None
+    configured_account_assigned: bool | None
+    configured_account_accessible: bool | None
+    ready: bool
+    reason_code: str | None
+    provider_http_status: int | None
+
+
+class InstagramCredentialDiagnosticResponse(BaseModel):
+    success: bool = True
+    message: str = "Instagram credential readiness checked"
+    data: InstagramCredentialDiagnosticData
+
+
 class InstagramBlockingReason(BaseModel):
     code: str
     message: str
@@ -117,6 +137,7 @@ class InstagramMessageData(BaseModel):
     status: Literal["received", "accepted", "read", "failed", "unknown"]
     provider_message_id: str | None
     provider_error_code: str | None
+    provider_http_status: int | None
     failure_reason: str | None
     requested_by_user_id: uuid.UUID | None
     occurred_at: datetime

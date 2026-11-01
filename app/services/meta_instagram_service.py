@@ -186,6 +186,13 @@ def provider_for_channel(
     provider: MetaInstagramProvider,
     channel: WhatsAppChannel,
 ) -> MetaInstagramProvider:
+    return provider_and_source_for_channel(provider, channel)[0]
+
+
+def provider_and_source_for_channel(
+    provider: MetaInstagramProvider,
+    channel: WhatsAppChannel,
+) -> tuple[MetaInstagramProvider, str]:
     if channel.credential_ciphertext:
         try:
             connected_token = decrypt_credential(channel.credential_ciphertext)
@@ -197,11 +204,13 @@ def provider_for_channel(
                 safe_message="The connected Instagram credential is unavailable"
             ) from exception
         selected = provider.with_access_token(connected_token)
+        source = "channel_encrypted"
     else:
         selected = provider
+        source = "environment"
     if not selected.send_api_configured:
         raise MetaInstagramConfigurationError()
-    return selected
+    return selected, source
 
 
 def get_instagram_conversation_record(
@@ -487,6 +496,7 @@ async def send_reply(
             elif isinstance(provider_error, (MetaInstagramRejectedError, MetaInstagramConfigurationError)):
                 stored.status = "failed"
                 stored.provider_error_code = provider_error.code
+                stored.provider_http_status = provider_error.http_status
                 stored.failure_reason = provider_error.safe_message
             else:
                 stored.status = "unknown"

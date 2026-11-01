@@ -12,6 +12,7 @@ from app.models.meta_instagram_oauth import MetaInstagramOAuthState
 from app.models.whatsapp import WhatsAppChannel
 from app.providers.meta_instagram import (
     MetaInstagramConfigurationError,
+    MetaInstagramError,
     MetaInstagramOAuthError,
     MetaInstagramProvider,
 )
@@ -53,6 +54,28 @@ def _aware(value: datetime) -> datetime:
 
 def _state_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _record_failure(
+    database_session: Session,
+    record: MetaInstagramOAuthState,
+    *,
+    stage: str,
+    code: str,
+) -> None:
+    add_authorization_audit(
+        database_session,
+        tenant_id=record.tenant_id,
+        actor_user_id=record.requested_by_user_id,
+        action="meta_instagram.oauth.failed",
+        target_membership_id=None,
+        details={
+            "channel_id": str(record.channel_id),
+            "stage": stage,
+            "reason_code": code,
+        },
+    )
+    database_session.commit()
 
 
 def begin_instagram_oauth(
@@ -137,23 +160,59 @@ async def complete_instagram_oauth(
     database_session.commit()
 
     if provider_error:
+        _record_failure(
+            database_session,
+            record,
+            stage="authorization",
+            code="oauth_authorization_denied",
+        )
         raise MetaInstagramOAuthError(
             code="oauth_authorization_denied",
             safe_message="Meta Instagram authorization was not completed",
             http_status=400,
         )
     if code is None or not code.strip() or len(code) > 4096:
+        _record_failure(
+            database_session,
+            record,
+            stage="callback_validation",
+            code="oauth_code_missing",
+        )
         raise MetaInstagramOAuthError(
             code="oauth_code_missing",
             safe_message="Meta Instagram authorization code is missing",
             http_status=400,
         )
 
-    token = await provider.exchange_code(code.strip())
-    await provider.verify_account_access(token.access_token)
+    try:
+        token = await provider.exchange_code(code.strip())
+    except MetaInstagramError as exception:
+        _record_failure(
+            database_session,
+            record,
+            stage="code_exchange",
+            code=exception.code,
+        )
+        raise
+    try:
+        await provider.verify_account_access(token.access_token)
+    except MetaInstagramError as exception:
+        _record_failure(
+            database_session,
+            record,
+            stage="account_verification",
+            code=exception.code,
+        )
+        raise
     try:
         token_ciphertext = encrypt_credential(token.access_token)
     except CredentialEncryptionNotConfiguredError as exception:
+        _record_failure(
+            database_session,
+            record,
+            stage="credential_encryption",
+            code="credential_encryption_not_configured",
+        )
         raise MetaInstagramConfigurationError(
             safe_message="Secure Instagram credential storage is not configured"
         ) from exception
@@ -171,6 +230,12 @@ async def complete_instagram_oauth(
         .with_for_update()
     )
     if channel is None:
+        _record_failure(
+            database_session,
+            record,
+            stage="credential_persistence",
+            code="oauth_channel_unavailable",
+        )
         raise MetaInstagramOAuthStateError(
             "oauth_channel_unavailable",
             "The Instagram channel is no longer available",

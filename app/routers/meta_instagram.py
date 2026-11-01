@@ -25,6 +25,8 @@ from app.schemas.meta_instagram import (
     InstagramConversationPageData,
     InstagramConversationPageResponse,
     InstagramConversationResponse,
+    InstagramCredentialDiagnosticData,
+    InstagramCredentialDiagnosticResponse,
     InstagramLinkedRecord,
     InstagramMediaMetadata,
     InstagramMessageData,
@@ -66,6 +68,7 @@ from app.services.meta_instagram_service import (
     mark_read,
     page_count,
     process_instagram_webhook_payload,
+    provider_and_source_for_channel,
     recover_operation,
     send_reply,
 )
@@ -98,6 +101,7 @@ def _message_data(message: WhatsAppMessage) -> InstagramMessageData:
         status=message.status,
         provider_message_id=message.provider_message_sid,
         provider_error_code=message.provider_error_code,
+        provider_http_status=message.provider_http_status,
         failure_reason=message.failure_reason,
         requested_by_user_id=message.requested_by_user_id,
         occurred_at=message.occurred_at,
@@ -161,6 +165,61 @@ def _channel_unavailable(exception: Exception) -> None:
             "message": "The workspace Instagram account channel is not configured",
         },
     ) from exception
+
+
+@router.get(
+    "/diagnostics/readiness",
+    response_model=InstagramCredentialDiagnosticResponse,
+)
+async def instagram_credential_readiness(
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_VIEW)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    provider: Annotated[MetaInstagramProvider, Depends(get_meta_instagram_provider)],
+) -> InstagramCredentialDiagnosticResponse:
+    try:
+        channel = channel_for_context(database_session, context, provider)
+    except MetaInstagramChannelNotConfiguredError as exception:
+        _channel_unavailable(exception)
+    source = "channel_encrypted" if channel.credential_ciphertext else "environment"
+    try:
+        selected_provider, source = provider_and_source_for_channel(provider, channel)
+        diagnostic = await selected_provider.inspect_account_access(
+            selected_provider.access_token
+        )
+    except MetaInstagramError as exception:
+        return InstagramCredentialDiagnosticResponse(
+            data=InstagramCredentialDiagnosticData(
+                credential_source=source,
+                channel_credential_present=bool(channel.credential_ciphertext),
+                token_valid=None,
+                token_type=None,
+                issuing_app_matches=None,
+                required_scopes_granted=None,
+                configured_account_assigned=None,
+                configured_account_accessible=None,
+                ready=False,
+                reason_code=exception.code,
+                provider_http_status=exception.http_status,
+            )
+        )
+    return InstagramCredentialDiagnosticResponse(
+        data=InstagramCredentialDiagnosticData(
+            credential_source=source,
+            channel_credential_present=bool(channel.credential_ciphertext),
+            token_valid=diagnostic.token_valid,
+            token_type=diagnostic.token_type,
+            issuing_app_matches=diagnostic.issuing_app_matches,
+            required_scopes_granted=diagnostic.required_scopes_granted,
+            configured_account_assigned=diagnostic.configured_account_assigned,
+            configured_account_accessible=diagnostic.configured_account_accessible,
+            ready=diagnostic.reason_code is None,
+            reason_code=diagnostic.reason_code,
+            provider_http_status=diagnostic.provider_http_status,
+        )
+    )
 
 
 @router.get("/channel", response_model=InstagramChannelResponse)
