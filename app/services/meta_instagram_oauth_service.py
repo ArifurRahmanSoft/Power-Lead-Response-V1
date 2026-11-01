@@ -3,6 +3,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -44,6 +45,26 @@ class MetaInstagramOAuthCompletion:
     account_id: str
 
 
+@dataclass(frozen=True)
+class MetaInstagramOAuthRedirectDiagnostic:
+    configured_scheme: str | None
+    configured_host: str | None
+    configured_path: str | None
+    configured_has_query: bool
+    configured_has_fragment: bool
+    latest_operation_found: bool
+    operation_scheme: str | None
+    operation_host: str | None
+    operation_path: str | None
+    operation_has_query: bool | None
+    operation_has_fragment: bool | None
+    exact_match: bool | None
+    scheme_match: bool | None
+    host_match: bool | None
+    path_match: bool | None
+    trailing_slash_match: bool | None
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -56,22 +77,98 @@ def _state_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def oauth_redirect_diagnostic(
+    database_session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    configured_redirect_uri: str,
+) -> MetaInstagramOAuthRedirectDiagnostic:
+    """Return safe redirect metadata without exposing state, code, or tokens."""
+    latest = database_session.scalar(
+        select(MetaInstagramOAuthState)
+        .where(MetaInstagramOAuthState.tenant_id == tenant_id)
+        .order_by(
+            MetaInstagramOAuthState.created_at.desc(),
+            MetaInstagramOAuthState.id.desc(),
+        )
+        .limit(1)
+    )
+    configured = urlsplit(configured_redirect_uri)
+    operation = urlsplit(latest.redirect_uri) if latest is not None else None
+    return MetaInstagramOAuthRedirectDiagnostic(
+        configured_scheme=configured.scheme or None,
+        configured_host=configured.hostname,
+        configured_path=configured.path or None,
+        configured_has_query=bool(configured.query),
+        configured_has_fragment=bool(configured.fragment),
+        latest_operation_found=latest is not None,
+        operation_scheme=(operation.scheme or None) if operation else None,
+        operation_host=operation.hostname if operation else None,
+        operation_path=(operation.path or None) if operation else None,
+        operation_has_query=bool(operation.query) if operation else None,
+        operation_has_fragment=bool(operation.fragment) if operation else None,
+        exact_match=(latest.redirect_uri == configured_redirect_uri) if latest else None,
+        scheme_match=(operation.scheme == configured.scheme) if operation else None,
+        host_match=(operation.hostname == configured.hostname) if operation else None,
+        path_match=(operation.path == configured.path) if operation else None,
+        trailing_slash_match=(
+            operation.path.endswith("/") == configured.path.endswith("/")
+            if operation
+            else None
+        ),
+    )
+
+
 def _record_failure(
     database_session: Session,
     record: MetaInstagramOAuthState,
     *,
     stage: str,
     code: str,
+    provider_http_status: int | None = None,
+    provider_code: str | None = None,
+    provider_subcode: str | None = None,
+    error_category: str | None = None,
 ) -> None:
+    details: dict[str, object] = {
+        "channel_id": str(record.channel_id),
+        "stage": stage,
+        "reason_code": code,
+    }
+    if provider_http_status is not None:
+        details["provider_http_status"] = provider_http_status
+    if provider_code is not None:
+        details["provider_code"] = provider_code
+    if provider_subcode is not None:
+        details["provider_subcode"] = provider_subcode
+    if error_category is not None:
+        details["error_category"] = error_category
     add_authorization_audit(
         database_session,
         tenant_id=record.tenant_id,
         actor_user_id=record.requested_by_user_id,
         action="meta_instagram.oauth.failed",
         target_membership_id=None,
+        details=details,
+    )
+    database_session.commit()
+
+
+def _record_rejection(
+    database_session: Session,
+    record: MetaInstagramOAuthState,
+    *,
+    code: str,
+) -> None:
+    add_authorization_audit(
+        database_session,
+        tenant_id=record.tenant_id,
+        actor_user_id=record.requested_by_user_id,
+        action="meta_instagram.oauth.rejected",
+        target_membership_id=None,
         details={
             "channel_id": str(record.channel_id),
-            "stage": stage,
+            "stage": "state_validation",
             "reason_code": code,
         },
     )
@@ -148,10 +245,13 @@ async def complete_instagram_oauth(
         raise MetaInstagramOAuthStateError("invalid_oauth_state", "Invalid OAuth state")
     now = _now()
     if record.used_at is not None:
+        _record_rejection(database_session, record, code="oauth_state_used")
         raise MetaInstagramOAuthStateError("oauth_state_used", "OAuth state was already used")
     if _aware(record.expires_at) <= now:
+        _record_rejection(database_session, record, code="oauth_state_expired")
         raise MetaInstagramOAuthStateError("oauth_state_expired", "OAuth state has expired")
     if record.redirect_uri != provider.oauth_redirect_uri:
+        _record_rejection(database_session, record, code="oauth_redirect_mismatch")
         raise MetaInstagramOAuthStateError(
             "oauth_redirect_mismatch",
             "OAuth redirect configuration changed; start authorization again",
@@ -185,13 +285,20 @@ async def complete_instagram_oauth(
         )
 
     try:
-        token = await provider.exchange_code(code.strip())
+        token = await provider.exchange_code(
+            code.strip(),
+            redirect_uri=record.redirect_uri,
+        )
     except MetaInstagramError as exception:
         _record_failure(
             database_session,
             record,
             stage="code_exchange",
             code=exception.code,
+            provider_http_status=exception.http_status,
+            provider_code=exception.provider_code,
+            provider_subcode=exception.provider_subcode,
+            error_category=exception.error_category,
         )
         raise
     try:
@@ -202,6 +309,10 @@ async def complete_instagram_oauth(
             record,
             stage="account_verification",
             code=exception.code,
+            provider_http_status=exception.http_status,
+            provider_code=exception.provider_code,
+            provider_subcode=exception.provider_subcode,
+            error_category=exception.error_category,
         )
         raise
     try:

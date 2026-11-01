@@ -13,13 +13,15 @@ import httpx
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import select
+from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 import app.commands.map_meta_instagram_account as mapping_command
 import app.providers.meta_instagram as meta_instagram_provider_module
 import app.routers.meta_instagram as instagram_router_module
 from app.core.config import Settings
+from app.core.database import Base
 from app.core.permissions import RoleKey
 from app.core.sensitive_query import SensitiveQueryRedactionMiddleware
 from app.main import app
@@ -38,9 +40,11 @@ from app.providers.meta_instagram import (
     MetaInstagramAcceptanceUnknownError,
     MetaInstagramConfigurationError,
     MetaInstagramCredentialDiagnostic,
+    MetaInstagramOAuthConfigurationDiagnostic,
     MetaInstagramProvider,
     MetaInstagramOAuthError,
     MetaInstagramOAuthToken,
+    MetaInstagramSettingDiagnostic,
     MetaInstagramRejectedError,
     MetaInstagramResult,
     get_meta_instagram_provider,
@@ -49,6 +53,10 @@ from app.providers.meta_instagram import (
 from app.services.meta_instagram_service import (
     process_instagram_webhook_payload,
     provider_for_channel,
+)
+from app.services.meta_instagram_oauth_service import (
+    MetaInstagramOAuthStateError,
+    complete_instagram_oauth,
 )
 from app.utils.credential_encryption import decrypt_credential, encrypt_credential
 from tests.test_outbound_messages import setup
@@ -96,9 +104,15 @@ class MockInstagramOAuthProvider(MockInstagramProvider):
         "https://api.example.test/api/integrations/meta/instagram/oauth/callback"
     )
 
-    def __init__(self, *, assignment_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        assignment_error: Exception | None = None,
+        exchange_error: Exception | None = None,
+    ) -> None:
         super().__init__()
         self.assignment_error = assignment_error
+        self.exchange_error = exchange_error
         self.exchanged_codes: list[str] = []
         self.verified_tokens: list[str] = []
         self.sent_access_tokens: list[str] = []
@@ -121,8 +135,16 @@ class MockInstagramOAuthProvider(MockInstagramProvider):
             }
         )
 
-    async def exchange_code(self, code: str) -> MetaInstagramOAuthToken:
+    async def exchange_code(
+        self,
+        code: str,
+        *,
+        redirect_uri: str,
+    ) -> MetaInstagramOAuthToken:
         self.exchanged_codes.append(code)
+        assert redirect_uri == self.oauth_redirect_uri
+        if self.exchange_error is not None:
+            raise self.exchange_error
         return MetaInstagramOAuthToken(
             access_token="fixture-connected-system-user-token",
             token_type="bearer",
@@ -150,6 +172,27 @@ class MockInstagramOAuthProvider(MockInstagramProvider):
             required_scopes_granted=True,
             configured_account_assigned=True,
             configured_account_accessible=True,
+        )
+
+    def oauth_configuration_diagnostic(
+        self,
+    ) -> MetaInstagramOAuthConfigurationDiagnostic:
+        names = (
+            "META_INSTAGRAM_APP_ID",
+            "META_INSTAGRAM_CONFIG_ID",
+            "META_INSTAGRAM_ACCOUNT_ID",
+            "META_INSTAGRAM_APP_SECRET",
+            "META_INSTAGRAM_OAUTH_REDIRECT_URI",
+            "META_GRAPH_API_VERSION",
+        )
+        return MetaInstagramOAuthConfigurationDiagnostic(
+            settings=tuple(
+                MetaInstagramSettingDiagnostic(name=name, present=True, format_valid=True)
+                for name in names
+            ),
+            missing_settings=(),
+            invalid_settings=(),
+            ready=True,
         )
 
 
@@ -372,6 +415,67 @@ def test_provider_uses_injected_central_instagram_settings() -> None:
     assert configured.send_api_configured is True
 
 
+@pytest.mark.parametrize(
+    ("attribute", "setting_name", "missing_value", "invalid_value"),
+    [
+        ("meta_instagram_app_id", "META_INSTAGRAM_APP_ID", None, "app-id"),
+        ("meta_instagram_config_id", "META_INSTAGRAM_CONFIG_ID", None, "config-id"),
+        ("meta_instagram_account_id", "META_INSTAGRAM_ACCOUNT_ID", None, "account-id"),
+        (
+            "meta_instagram_app_secret",
+            "META_INSTAGRAM_APP_SECRET",
+            SecretStr("   "),
+            None,
+        ),
+        (
+            "meta_instagram_oauth_redirect_uri",
+            "META_INSTAGRAM_OAUTH_REDIRECT_URI",
+            None,
+            "http://api.example.test/oauth/callback",
+        ),
+        ("meta_graph_api_version", "META_GRAPH_API_VERSION", None, "26.0"),
+    ],
+)
+def test_oauth_configuration_diagnostics_cover_missing_and_invalid_branches(
+    attribute: str,
+    setting_name: str,
+    missing_value,
+    invalid_value,
+) -> None:
+    base = {
+        "meta_instagram_config_id": TEST_CONFIGURATION_ID,
+        "meta_instagram_app_id": "9000000000000505",
+        "meta_instagram_account_id": TEST_ACCOUNT_ID,
+        "meta_instagram_access_token": SecretStr("fixture-access-token"),
+        "meta_instagram_verify_token": SecretStr("fixture-verify-token"),
+        "meta_instagram_app_secret": SecretStr("fixture-app-secret"),
+        "meta_instagram_oauth_redirect_uri": (
+            "https://api.example.test/api/integrations/meta/instagram/oauth/callback"
+        ),
+        "meta_graph_api_version": "v26.0",
+        "meta_instagram_timeout_seconds": 12.0,
+    }
+    valid = MetaInstagramProvider(SimpleNamespace(**base))
+    assert valid.oauth_configuration_diagnostic().ready is True
+
+    missing = dict(base)
+    missing[attribute] = missing_value
+    missing_result = MetaInstagramProvider(
+        SimpleNamespace(**missing)
+    ).oauth_configuration_diagnostic()
+    assert missing_result.ready is False
+    assert setting_name in missing_result.missing_settings
+
+    if invalid_value is not None:
+        invalid = dict(base)
+        invalid[attribute] = invalid_value
+        invalid_result = MetaInstagramProvider(
+            SimpleNamespace(**invalid)
+        ).oauth_configuration_diagnostic()
+        assert invalid_result.ready is False
+        assert setting_name in invalid_result.invalid_settings
+
+
 def test_missing_instagram_settings_fail_safely_without_real_fallbacks() -> None:
     missing = MetaInstagramProvider(
         SimpleNamespace(
@@ -444,7 +548,16 @@ def test_unified_login_oauth_connect_stores_verified_token_encrypted(
         assert query["redirect_uri"] == [provider.oauth_redirect_uri]
         assert "access_token" not in authorization_url
 
+        redirect_diagnostic = client.get(
+            "/api/messages/meta/instagram/diagnostics/readiness",
+            headers=headers,
+        )
+
         callback = client.get(
+            "/api/integrations/meta/instagram/oauth/callback",
+            params={"state": state, "code": "fixture-authorization-code"},
+        )
+        duplicate = client.get(
             "/api/integrations/meta/instagram/oauth/callback",
             params={"state": state, "code": "fixture-authorization-code"},
         )
@@ -457,6 +570,29 @@ def test_unified_login_oauth_connect_stores_verified_token_encrypted(
         app.dependency_overrides.pop(get_meta_instagram_provider, None)
 
     assert callback.status_code == 200, callback.text
+    assert redirect_diagnostic.status_code == 200
+    redirect_data = redirect_diagnostic.json()["data"]["oauth_redirect"]
+    assert redirect_data == {
+        "configured_scheme": "https",
+        "configured_host": "api.example.test",
+        "configured_path": "/api/integrations/meta/instagram/oauth/callback",
+        "configured_has_query": False,
+        "configured_has_fragment": False,
+        "latest_operation_found": True,
+        "operation_scheme": "https",
+        "operation_host": "api.example.test",
+        "operation_path": "/api/integrations/meta/instagram/oauth/callback",
+        "operation_has_query": False,
+        "operation_has_fragment": False,
+        "exact_match": True,
+        "scheme_match": True,
+        "host_match": True,
+        "path_match": True,
+        "trailing_slash_match": True,
+    }
+    assert state not in redirect_diagnostic.text
+    assert duplicate.status_code == 400
+    assert duplicate.json()["detail"]["code"] == "oauth_state_used"
     assert reply.status_code == 200, reply.text
     assert callback.json()["data"]["account_id"] == TEST_ACCOUNT_ID
     assert provider.exchanged_codes == ["fixture-authorization-code"]
@@ -473,6 +609,167 @@ def test_unified_login_oauth_connect_stores_verified_token_encrypted(
     state_record = database_session.scalar(select(MetaInstagramOAuthState))
     assert state_record is not None and state_record.used_at is not None
     assert state not in state_record.state_hash
+    replay_audit = database_session.scalar(
+        select(AuthorizationAudit).where(
+            AuthorizationAudit.action == "meta_instagram.oauth.rejected"
+        )
+    )
+    assert replay_audit is not None
+    assert replay_audit.details["stage"] == "state_validation"
+    assert replay_audit.details["reason_code"] == "oauth_state_used"
+
+
+def test_failed_code_exchange_consumes_state_without_saving_credential(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    provider = MockInstagramOAuthProvider(
+        exchange_error=MetaInstagramOAuthError(
+            code="100:36008",
+            safe_message="Meta rejected the Instagram authorization code",
+            http_status=400,
+            provider_code="100",
+            provider_subcode="36008",
+            error_category="oauth_code_exchange_rejected",
+        )
+    )
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        initiated = client.post(
+            "/api/messages/meta/instagram/connect/initiate",
+            headers=headers,
+        )
+        state = parse_qs(
+            urlparse(initiated.json()["data"]["authorization_url"]).query
+        )["state"][0]
+        failed = client.get(
+            "/api/integrations/meta/instagram/oauth/callback",
+            params={"state": state, "code": "fixture-rejected-code"},
+        )
+        replay = client.get(
+            "/api/integrations/meta/instagram/oauth/callback",
+            params={"state": state, "code": "fixture-rejected-code"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+
+    assert failed.status_code == 400
+    assert failed.json()["detail"]["code"] == "100:36008"
+    assert replay.status_code == 400
+    assert replay.json()["detail"]["code"] == "oauth_state_used"
+    assert provider.exchanged_codes == ["fixture-rejected-code"]
+    database_session.expire_all()
+    stored_channel = database_session.get(WhatsAppChannel, channel.id)
+    assert stored_channel is not None
+    assert stored_channel.credential_ciphertext is None
+    audit = database_session.scalar(
+        select(AuthorizationAudit).where(
+            AuthorizationAudit.action == "meta_instagram.oauth.failed"
+        )
+    )
+    assert audit is not None
+    assert audit.details["stage"] == "code_exchange"
+    assert audit.details["reason_code"] == "100:36008"
+    assert audit.details["provider_http_status"] == 400
+    assert audit.details["provider_code"] == "100"
+    assert audit.details["provider_subcode"] == "36008"
+    assert audit.details["error_category"] == "oauth_code_exchange_rejected"
+
+
+def test_concurrent_callbacks_allow_only_one_state_claim(tmp_path) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'oauth-concurrency.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        expire_on_commit=False,
+        class_=Session,
+    )
+    raw_state = "fixture-concurrent-state"
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    channel_id = uuid.uuid4()
+    redirect_uri = "https://api.example.test/oauth/callback"
+    with session_factory() as seed:
+        seed.add(
+            MetaInstagramOAuthState(
+                tenant_id=tenant_id,
+                requested_by_user_id=user_id,
+                channel_id=channel_id,
+                state_hash=hashlib.sha256(raw_state.encode()).hexdigest(),
+                redirect_uri=redirect_uri,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+        )
+        seed.commit()
+
+    class BlockingExchangeProvider:
+        oauth_redirect_uri = redirect_uri
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.exchange_calls = 0
+
+        async def exchange_code(
+            self,
+            code: str,
+            *,
+            redirect_uri: str,
+        ) -> MetaInstagramOAuthToken:
+            del code
+            assert redirect_uri == self.oauth_redirect_uri
+            self.exchange_calls += 1
+            self.started.set()
+            await self.release.wait()
+            raise MetaInstagramOAuthError(
+                code="fixture_exchange_failed",
+                safe_message="Fixture exchange failed",
+                http_status=400,
+            )
+
+    provider = BlockingExchangeProvider()
+
+    async def scenario() -> None:
+        first_session = session_factory()
+        second_session = session_factory()
+        try:
+            first = asyncio.create_task(
+                complete_instagram_oauth(
+                    first_session,
+                    provider,
+                    state=raw_state,
+                    code="first-code",
+                    provider_error=None,
+                )
+            )
+            await provider.started.wait()
+            with pytest.raises(MetaInstagramOAuthStateError) as duplicate:
+                await complete_instagram_oauth(
+                    second_session,
+                    provider,
+                    state=raw_state,
+                    code="second-code",
+                    provider_error=None,
+                )
+            assert duplicate.value.code == "oauth_state_used"
+            provider.release.set()
+            with pytest.raises(MetaInstagramOAuthError):
+                await first
+        finally:
+            first_session.close()
+            second_session.close()
+
+    asyncio.run(scenario())
+    assert provider.exchange_calls == 1
+    with session_factory() as verify:
+        state_record = verify.scalar(select(MetaInstagramOAuthState))
+        assert state_record is not None and state_record.used_at is not None
 
 
 def test_unified_login_oauth_rejects_invalid_state_without_exchange(
@@ -553,20 +850,32 @@ def test_readiness_reports_effective_source_and_never_falls_back_on_bad_cipherte
             "/api/messages/meta/instagram/diagnostics/readiness",
             headers=headers,
         )
+        checked_environment = client.get(
+            "/api/messages/meta/instagram/diagnostics/readiness",
+            headers=headers,
+            params={"verify_provider": "true"},
+        )
         channel.credential_ciphertext = "not-a-valid-fernet-token"
         database_session.commit()
         encrypted_failure = client.get(
             "/api/messages/meta/instagram/diagnostics/readiness",
             headers=headers,
+            params={"verify_provider": "true"},
         )
     finally:
         app.dependency_overrides.pop(get_meta_instagram_provider, None)
 
     assert environment.status_code == 200
     environment_data = environment.json()["data"]
-    assert environment_data["credential_source"] == "environment"
-    assert environment_data["ready"] is True
-    failure_data = encrypted_failure.json()["data"]
+    assert environment_data["oauth_configuration_ready"] is True
+    assert environment_data["provider_check_performed"] is False
+    assert environment_data["provider_readiness"] is None
+
+    assert checked_environment.status_code == 200
+    checked_data = checked_environment.json()["data"]["provider_readiness"]
+    assert checked_data["credential_source"] == "environment"
+    assert checked_data["ready"] is True
+    failure_data = encrypted_failure.json()["data"]["provider_readiness"]
     assert failure_data["credential_source"] == "channel_encrypted"
     assert failure_data["channel_credential_present"] is True
     assert failure_data["ready"] is False
@@ -645,6 +954,150 @@ def test_connected_channel_token_overrides_environment_token() -> None:
 
     assert selected.access_token == "fixture-connected-token"
     assert provider.access_token == "fixture-environment-token"
+
+
+def test_oauth_authorization_and_exchange_follow_unified_login_contract(
+    monkeypatch,
+) -> None:
+    redirect_uri = (
+        "https://api.example.test/api/integrations/meta/instagram/oauth/callback"
+    )
+    provider = MetaInstagramProvider(
+        SimpleNamespace(
+            meta_instagram_config_id=TEST_CONFIGURATION_ID,
+            meta_instagram_app_id="9000000000000505",
+            meta_instagram_account_id=TEST_ACCOUNT_ID,
+            meta_instagram_access_token=SecretStr("fixture-environment-token"),
+            meta_instagram_verify_token=SecretStr("fixture-verify-token"),
+            meta_instagram_app_secret=SecretStr("fixture-app-secret"),
+            meta_instagram_oauth_redirect_uri=redirect_uri,
+            meta_graph_api_version="v26.0",
+            meta_instagram_timeout_seconds=12.0,
+        )
+    )
+    authorization_url = provider.authorization_url(state="fixture-state")
+    parsed_authorization = urlparse(authorization_url)
+    authorization_query = parse_qs(parsed_authorization.query)
+    assert authorization_query["redirect_uri"] == [redirect_uri]
+    assert "%253A" not in parsed_authorization.query
+    assert "%252F" not in parsed_authorization.query
+
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "access_token": "fixture-connected-token",
+                "token_type": "bearer",
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            captured["client_options"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def get(self, url: str, **kwargs):
+            captured["url"] = url
+            captured["request_options"] = kwargs
+            captured["encoded_url"] = str(
+                httpx.Request("GET", url, params=kwargs["params"]).url
+            )
+            return FakeResponse()
+
+    monkeypatch.setattr(meta_instagram_provider_module.httpx, "AsyncClient", FakeClient)
+    token = asyncio.run(
+        provider.exchange_code(
+            "fixture-authorization-code",
+            redirect_uri=redirect_uri,
+        )
+    )
+
+    assert token.access_token == "fixture-connected-token"
+    assert captured["url"] == "https://graph.facebook.com/v26.0/oauth/access_token"
+    request_options = captured["request_options"]
+    assert isinstance(request_options, dict)
+    assert request_options["params"] == {
+        "client_id": "9000000000000505",
+        "client_secret": "fixture-app-secret",
+        "code": "fixture-authorization-code",
+        "redirect_uri": redirect_uri,
+    }
+    encoded_url = str(captured["encoded_url"])
+    encoded_query = parse_qs(urlparse(encoded_url).query)
+    assert encoded_query["redirect_uri"] == [redirect_uri]
+    assert "%253A" not in encoded_url
+    assert "%252F" not in encoded_url
+
+
+def test_oauth_exchange_classifies_provider_error_without_retaining_body(
+    monkeypatch,
+) -> None:
+    redirect_uri = "https://api.example.test/oauth/callback"
+    provider = MetaInstagramProvider(
+        SimpleNamespace(
+            meta_instagram_config_id=TEST_CONFIGURATION_ID,
+            meta_instagram_app_id="9000000000000505",
+            meta_instagram_account_id=TEST_ACCOUNT_ID,
+            meta_instagram_access_token=SecretStr("fixture-environment-token"),
+            meta_instagram_verify_token=SecretStr("fixture-verify-token"),
+            meta_instagram_app_secret=SecretStr("fixture-app-secret"),
+            meta_instagram_oauth_redirect_uri=redirect_uri,
+            meta_graph_api_version="v26.0",
+            meta_instagram_timeout_seconds=12.0,
+        )
+    )
+
+    class FakeResponse:
+        status_code = 400
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "error": {
+                    "message": "raw provider detail must not be retained",
+                    "code": 100,
+                    "error_subcode": 36008,
+                }
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+
+        async def get(self, url: str, **kwargs):
+            del url, kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr(meta_instagram_provider_module.httpx, "AsyncClient", FakeClient)
+    with pytest.raises(MetaInstagramOAuthError) as captured:
+        asyncio.run(
+            provider.exchange_code(
+                "fixture-rejected-code",
+                redirect_uri=redirect_uri,
+            )
+        )
+
+    error = captured.value
+    assert error.http_status == 400
+    assert error.code == "100:36008"
+    assert error.provider_code == "100"
+    assert error.provider_subcode == "36008"
+    assert error.error_category == "oauth_code_exchange_rejected"
+    assert "raw provider detail" not in error.safe_message
 
 
 @pytest.mark.parametrize(
@@ -772,6 +1225,9 @@ def test_meta_account_access_error_retains_subcode_and_safe_reason() -> None:
     error = MetaInstagramProvider._provider_error(response)
     assert error.http_status == 400
     assert error.code == "100:33"
+    assert error.provider_code == "100"
+    assert error.provider_subcode == "33"
+    assert error.error_category == "provider_rejected"
     assert error.safe_message == safe_instagram_error("100:33")
     assert "provider text" not in error.safe_message
 

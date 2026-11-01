@@ -24,12 +24,18 @@ class MetaInstagramError(Exception):
         code: str | None = None,
         safe_message: str | None = None,
         http_status: int | None = None,
+        provider_code: str | None = None,
+        provider_subcode: str | None = None,
+        error_category: str | None = None,
     ) -> None:
         if code is not None:
             self.code = code
         if safe_message is not None:
             self.safe_message = safe_message
         self.http_status = http_status
+        self.provider_code = provider_code
+        self.provider_subcode = provider_subcode
+        self.error_category = error_category
         super().__init__(self.safe_message)
 
 
@@ -77,6 +83,21 @@ class MetaInstagramCredentialDiagnostic:
     configured_account_accessible: bool | None
     reason_code: str | None = None
     provider_http_status: int | None = None
+
+
+@dataclass(frozen=True)
+class MetaInstagramSettingDiagnostic:
+    name: str
+    present: bool
+    format_valid: bool
+
+
+@dataclass(frozen=True)
+class MetaInstagramOAuthConfigurationDiagnostic:
+    settings: tuple[MetaInstagramSettingDiagnostic, ...]
+    missing_settings: tuple[str, ...]
+    invalid_settings: tuple[str, ...]
+    ready: bool
 
 
 def safe_instagram_error(code: object) -> str:
@@ -129,7 +150,7 @@ class MetaInstagramProvider:
             else ""
         )
         self.app_secret = (
-            config.meta_instagram_app_secret.get_secret_value()
+            config.meta_instagram_app_secret.get_secret_value().strip()
             if config.meta_instagram_app_secret
             else ""
         )
@@ -139,6 +160,7 @@ class MetaInstagramProvider:
             else "missing"
         )
         version = (config.meta_graph_api_version or "").strip()
+        self.graph_api_version_raw = version
         self.graph_api_version = version if GRAPH_VERSION_PATTERN.fullmatch(version) else ""
         self.timeout_seconds = config.meta_instagram_timeout_seconds
         self.oauth_redirect_uri = (
@@ -164,13 +186,56 @@ class MetaInstagramProvider:
 
     @property
     def oauth_configured(self) -> bool:
-        return bool(
-            META_OBJECT_ID_PATTERN.fullmatch(self.app_id)
-            and META_OBJECT_ID_PATTERN.fullmatch(self.configuration_id)
-            and META_OBJECT_ID_PATTERN.fullmatch(self.account_id)
-            and self.app_secret
-            and self.oauth_redirect_uri.startswith("https://")
-            and self.graph_api_version
+        return self.oauth_configuration_diagnostic().ready
+
+    def oauth_configuration_diagnostic(
+        self,
+    ) -> MetaInstagramOAuthConfigurationDiagnostic:
+        values = (
+            MetaInstagramSettingDiagnostic(
+                name="META_INSTAGRAM_APP_ID",
+                present=bool(self.app_id),
+                format_valid=bool(META_OBJECT_ID_PATTERN.fullmatch(self.app_id)),
+            ),
+            MetaInstagramSettingDiagnostic(
+                name="META_INSTAGRAM_CONFIG_ID",
+                present=bool(self.configuration_id),
+                format_valid=bool(
+                    META_OBJECT_ID_PATTERN.fullmatch(self.configuration_id)
+                ),
+            ),
+            MetaInstagramSettingDiagnostic(
+                name="META_INSTAGRAM_ACCOUNT_ID",
+                present=bool(self.account_id),
+                format_valid=bool(META_OBJECT_ID_PATTERN.fullmatch(self.account_id)),
+            ),
+            MetaInstagramSettingDiagnostic(
+                name="META_INSTAGRAM_APP_SECRET",
+                present=bool(self.app_secret),
+                format_valid=bool(self.app_secret),
+            ),
+            MetaInstagramSettingDiagnostic(
+                name="META_INSTAGRAM_OAUTH_REDIRECT_URI",
+                present=bool(self.oauth_redirect_uri),
+                format_valid=self.oauth_redirect_uri.startswith("https://"),
+            ),
+            MetaInstagramSettingDiagnostic(
+                name="META_GRAPH_API_VERSION",
+                present=bool(self.graph_api_version_raw),
+                format_valid=bool(
+                    GRAPH_VERSION_PATTERN.fullmatch(self.graph_api_version_raw)
+                ),
+            ),
+        )
+        missing = tuple(item.name for item in values if not item.present)
+        invalid = tuple(
+            item.name for item in values if item.present and not item.format_valid
+        )
+        return MetaInstagramOAuthConfigurationDiagnostic(
+            settings=values,
+            missing_settings=missing,
+            invalid_settings=invalid,
+            ready=not missing and not invalid,
         )
 
     @property
@@ -200,7 +265,12 @@ class MetaInstagramProvider:
             }
         )
 
-    async def exchange_code(self, code: str) -> MetaInstagramOAuthToken:
+    async def exchange_code(
+        self,
+        code: str,
+        *,
+        redirect_uri: str,
+    ) -> MetaInstagramOAuthToken:
         if not self.oauth_configured:
             raise MetaInstagramConfigurationError(
                 safe_message="Meta Instagram Unified Login OAuth is not configured"
@@ -213,12 +283,14 @@ class MetaInstagramProvider:
                         "client_id": self.app_id,
                         "client_secret": self.app_secret,
                         "code": code,
+                        "redirect_uri": redirect_uri,
                     },
                 )
         except (httpx.TimeoutException, httpx.NetworkError) as exception:
             raise MetaInstagramOAuthError(
                 code="oauth_exchange_unavailable",
                 safe_message="Meta Instagram authorization exchange is temporarily unavailable",
+                error_category="provider_unavailable",
             ) from exception
         if response.status_code >= 400:
             error = self._provider_error(response)
@@ -226,6 +298,9 @@ class MetaInstagramProvider:
                 code=error.code,
                 safe_message="Meta rejected the Instagram authorization code",
                 http_status=error.http_status,
+                provider_code=error.provider_code,
+                provider_subcode=error.provider_subcode,
+                error_category="oauth_code_exchange_rejected",
             )
         try:
             document = response.json()
@@ -242,6 +317,7 @@ class MetaInstagramProvider:
             raise MetaInstagramOAuthError(
                 code="oauth_exchange_invalid_response",
                 safe_message="Meta returned an invalid Instagram authorization response",
+                error_category="invalid_provider_response",
             ) from exception
 
     async def inspect_account_access(
@@ -444,6 +520,9 @@ class MetaInstagramProvider:
             code=normalized,
             safe_message=safe_instagram_error(normalized),
             http_status=response.status_code,
+            provider_code=code,
+            provider_subcode=subcode,
+            error_category="provider_rejected",
         )
 
     async def send_text(self, *, to: str, body: str) -> MetaInstagramResult:

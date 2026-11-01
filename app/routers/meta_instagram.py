@@ -32,6 +32,8 @@ from app.schemas.meta_instagram import (
     InstagramMessageData,
     InstagramMessagePageData,
     InstagramMessagePageResponse,
+    InstagramOAuthRedirectDiagnosticData,
+    InstagramProviderReadinessData,
     InstagramOAuthCallbackData,
     InstagramOAuthCallbackResponse,
     InstagramOAuthStartData,
@@ -48,6 +50,7 @@ from app.services.meta_instagram_oauth_service import (
     MetaInstagramOAuthStateError,
     begin_instagram_oauth,
     complete_instagram_oauth,
+    oauth_redirect_diagnostic,
 )
 from app.services.meta_instagram_service import (
     MetaInstagramChannelNotConfiguredError,
@@ -178,7 +181,53 @@ async def instagram_credential_readiness(
     ],
     database_session: Annotated[Session, Depends(get_db)],
     provider: Annotated[MetaInstagramProvider, Depends(get_meta_instagram_provider)],
+    verify_provider: Annotated[bool, Query()] = False,
 ) -> InstagramCredentialDiagnosticResponse:
+    configuration = provider.oauth_configuration_diagnostic()
+    redirect = oauth_redirect_diagnostic(
+        database_session,
+        tenant_id=context.tenant.id,
+        configured_redirect_uri=provider.oauth_redirect_uri,
+    )
+    configuration_fields = {
+        "settings": [
+            {
+                "name": item.name,
+                "present": item.present,
+                "format_valid": item.format_valid,
+            }
+            for item in configuration.settings
+        ],
+        "missing_settings": list(configuration.missing_settings),
+        "invalid_settings": list(configuration.invalid_settings),
+        "oauth_configuration_ready": configuration.ready,
+        "oauth_redirect": InstagramOAuthRedirectDiagnosticData(
+            configured_scheme=redirect.configured_scheme,
+            configured_host=redirect.configured_host,
+            configured_path=redirect.configured_path,
+            configured_has_query=redirect.configured_has_query,
+            configured_has_fragment=redirect.configured_has_fragment,
+            latest_operation_found=redirect.latest_operation_found,
+            operation_scheme=redirect.operation_scheme,
+            operation_host=redirect.operation_host,
+            operation_path=redirect.operation_path,
+            operation_has_query=redirect.operation_has_query,
+            operation_has_fragment=redirect.operation_has_fragment,
+            exact_match=redirect.exact_match,
+            scheme_match=redirect.scheme_match,
+            host_match=redirect.host_match,
+            path_match=redirect.path_match,
+            trailing_slash_match=redirect.trailing_slash_match,
+        ),
+    }
+    if not verify_provider:
+        return InstagramCredentialDiagnosticResponse(
+            data=InstagramCredentialDiagnosticData(
+                **configuration_fields,
+                provider_check_performed=False,
+                provider_readiness=None,
+            )
+        )
     try:
         channel = channel_for_context(database_session, context, provider)
     except MetaInstagramChannelNotConfiguredError as exception:
@@ -192,32 +241,40 @@ async def instagram_credential_readiness(
     except MetaInstagramError as exception:
         return InstagramCredentialDiagnosticResponse(
             data=InstagramCredentialDiagnosticData(
-                credential_source=source,
-                channel_credential_present=bool(channel.credential_ciphertext),
-                token_valid=None,
-                token_type=None,
-                issuing_app_matches=None,
-                required_scopes_granted=None,
-                configured_account_assigned=None,
-                configured_account_accessible=None,
-                ready=False,
-                reason_code=exception.code,
-                provider_http_status=exception.http_status,
+                **configuration_fields,
+                provider_check_performed=True,
+                provider_readiness=InstagramProviderReadinessData(
+                    credential_source=source,
+                    channel_credential_present=bool(channel.credential_ciphertext),
+                    token_valid=None,
+                    token_type=None,
+                    issuing_app_matches=None,
+                    required_scopes_granted=None,
+                    configured_account_assigned=None,
+                    configured_account_accessible=None,
+                    ready=False,
+                    reason_code=exception.code,
+                    provider_http_status=exception.http_status,
+                ),
             )
         )
     return InstagramCredentialDiagnosticResponse(
         data=InstagramCredentialDiagnosticData(
-            credential_source=source,
-            channel_credential_present=bool(channel.credential_ciphertext),
-            token_valid=diagnostic.token_valid,
-            token_type=diagnostic.token_type,
-            issuing_app_matches=diagnostic.issuing_app_matches,
-            required_scopes_granted=diagnostic.required_scopes_granted,
-            configured_account_assigned=diagnostic.configured_account_assigned,
-            configured_account_accessible=diagnostic.configured_account_accessible,
-            ready=diagnostic.reason_code is None,
-            reason_code=diagnostic.reason_code,
-            provider_http_status=diagnostic.provider_http_status,
+            **configuration_fields,
+            provider_check_performed=True,
+            provider_readiness=InstagramProviderReadinessData(
+                credential_source=source,
+                channel_credential_present=bool(channel.credential_ciphertext),
+                token_valid=diagnostic.token_valid,
+                token_type=diagnostic.token_type,
+                issuing_app_matches=diagnostic.issuing_app_matches,
+                required_scopes_granted=diagnostic.required_scopes_granted,
+                configured_account_assigned=diagnostic.configured_account_assigned,
+                configured_account_accessible=diagnostic.configured_account_accessible,
+                ready=diagnostic.reason_code is None,
+                reason_code=diagnostic.reason_code,
+                provider_http_status=diagnostic.provider_http_status,
+            ),
         )
     )
 

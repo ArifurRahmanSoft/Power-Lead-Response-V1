@@ -45,7 +45,20 @@ class InstagramOAuthCallbackResponse(BaseModel):
     data: InstagramOAuthCallbackData
 
 
-class InstagramCredentialDiagnosticData(BaseModel):
+class InstagramConfigurationSettingData(BaseModel):
+    name: Literal[
+        "META_INSTAGRAM_APP_ID",
+        "META_INSTAGRAM_CONFIG_ID",
+        "META_INSTAGRAM_ACCOUNT_ID",
+        "META_INSTAGRAM_APP_SECRET",
+        "META_INSTAGRAM_OAUTH_REDIRECT_URI",
+        "META_GRAPH_API_VERSION",
+    ]
+    present: bool
+    format_valid: bool
+
+
+class InstagramProviderReadinessData(BaseModel):
     credential_source: Literal["channel_encrypted", "environment"]
     channel_credential_present: bool
     token_valid: bool | None
@@ -57,6 +70,35 @@ class InstagramCredentialDiagnosticData(BaseModel):
     ready: bool
     reason_code: str | None
     provider_http_status: int | None
+
+
+class InstagramOAuthRedirectDiagnosticData(BaseModel):
+    configured_scheme: str | None
+    configured_host: str | None
+    configured_path: str | None
+    configured_has_query: bool
+    configured_has_fragment: bool
+    latest_operation_found: bool
+    operation_scheme: str | None
+    operation_host: str | None
+    operation_path: str | None
+    operation_has_query: bool | None
+    operation_has_fragment: bool | None
+    exact_match: bool | None
+    scheme_match: bool | None
+    host_match: bool | None
+    path_match: bool | None
+    trailing_slash_match: bool | None
+
+
+class InstagramCredentialDiagnosticData(BaseModel):
+    settings: list[InstagramConfigurationSettingData]
+    missing_settings: list[str]
+    invalid_settings: list[str]
+    oauth_configuration_ready: bool
+    oauth_redirect: InstagramOAuthRedirectDiagnosticData
+    provider_check_performed: bool
+    provider_readiness: InstagramProviderReadinessData | None = None
 
 
 class InstagramCredentialDiagnosticResponse(BaseModel):

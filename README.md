@@ -1590,11 +1590,14 @@ the reply path without exposing it:
 GET /api/messages/meta/instagram/diagnostics/readiness
 ```
 
-The diagnostic requires `settings.integrations.view`, performs only read-only Meta
-requests, and reports `channel_encrypted` or `environment` plus safe readiness
-booleans and reason codes. A stored channel token always takes precedence. If it
-cannot be decrypted or validated, the application does not fall back to the
-environment token.
+The diagnostic requires `settings.integrations.view`. Its default response checks
+only the central backend configuration and does not call Meta. It returns present
+and format-valid booleans for every OAuth requirement plus stable missing/invalid
+setting names. Pass `verify_provider=true` only when a separate read-only Meta token
+and account check is needed. That optional result reports `channel_encrypted` or
+`environment` plus safe readiness booleans and reason codes. A stored channel token
+always takes precedence. If it cannot be decrypted or validated, the application
+does not fall back to the environment token.
 
 Never commit real IDs or secrets to `.env.example`. Missing account/token settings
 leave sending unavailable, and missing webhook settings cause safe webhook rejection.
