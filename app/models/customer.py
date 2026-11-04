@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     CheckConstraint,
@@ -8,6 +9,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -39,6 +41,20 @@ class Customer(Base):
             name="ck_t_customer_communication_consent",
         ),
         CheckConstraint("row_version >= 1", name="ck_t_customer_row_version_positive"),
+        CheckConstraint(
+            "source_type IS NULL OR source_type IN ('direct', 'lead')",
+            name="ck_t_customer_source_type",
+        ),
+        CheckConstraint(
+            "revenue_amount IS NULL OR revenue_amount >= 0",
+            name="ck_t_customer_revenue_nonnegative",
+        ),
+        CheckConstraint(
+            "(revenue_amount IS NULL AND revenue_currency IS NULL AND revenue_period IS NULL) OR "
+            "(revenue_amount IS NOT NULL AND revenue_currency IS NOT NULL AND revenue_period IS NOT NULL)",
+            name="ck_t_customer_revenue_complete",
+        ),
+        Index("ix_t_customer_assigned_user_id", "assigned_user_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -52,8 +68,30 @@ class Customer(Base):
     first_name: Mapped[str] = mapped_column(String(120), nullable=False)
     last_name: Mapped[str] = mapped_column(String(120), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
+    designation: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    country: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    linkedin_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    facebook_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    instagram_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    x_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    github_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    whatsapp_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     company: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    company_website: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    industry: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    service_requested: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    company_size: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    revenue_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    revenue_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    revenue_period: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("t_user.id", ondelete="SET NULL"), nullable=True
+    )
+    source_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     communication_purpose: Mapped[str] = mapped_column(
         String(40),
         nullable=False,
@@ -63,6 +101,8 @@ class Customer(Base):
     communication_consent_status: Mapped[str] = mapped_column(
         String(30), nullable=False, default="unknown", server_default="unknown"
     )
+    consent_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consent_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
     channel_restrictions: Mapped[list[str]] = mapped_column(
         JSON, nullable=False, default=list, server_default=text("'[]'")
     )
@@ -135,9 +175,9 @@ class LeadConversion(Base):
     converted_by: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("t_user.id", ondelete="RESTRICT"), nullable=False
     )
-    purchased_service: Mapped[str] = mapped_column(String(200), nullable=False)
+    purchased_service: Mapped[str | None] = mapped_column(String(200), nullable=True)
     reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     duplicate_resolution: Mapped[str] = mapped_column(String(30), nullable=False)
     pending_task_disposition: Mapped[str] = mapped_column(String(20), nullable=False)
     pending_task_reason: Mapped[str] = mapped_column(String(1000), nullable=False)

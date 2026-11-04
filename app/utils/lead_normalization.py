@@ -3,6 +3,8 @@ import re
 from urllib.parse import urlsplit, urlunsplit
 
 import pycountry
+import phonenumbers
+from phonenumbers import NumberParseException, PhoneNumberFormat
 
 _SCHEME_PREFIX = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -159,3 +161,65 @@ def normalize_country_name(value: object) -> str | None:
 
 def country_catalog_names() -> list[str]:
     return sorted(_COUNTRY_NAMES_BY_CODE.values())
+
+
+def _normalize_optional_contact_number(
+    value: object,
+    *,
+    country: object = None,
+    field_label: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_label} must be text, not a numeric value")
+    raw = value.strip()
+    if not raw:
+        return None
+    if field_label == "WhatsApp number" and raw.casefold().startswith("whatsapp:"):
+        raise ValueError("Enter the WhatsApp number without the whatsapp: prefix")
+
+    region: str | None = None
+    if not raw.startswith("+"):
+        region = country_name_to_code(country)
+        if region is None:
+            raise ValueError(
+                f"Local {field_label.lower()}s require a recognized country; "
+                "otherwise enter the full international number beginning with +"
+            )
+    try:
+        parsed = phonenumbers.parse(raw, region)
+    except NumberParseException as exception:
+        raise ValueError(
+            f"{field_label} is invalid; enter a valid international number"
+        ) from exception
+    if not phonenumbers.is_possible_number(parsed) or not phonenumbers.is_valid_number(parsed):
+        raise ValueError(
+            f"{field_label} is invalid; enter a valid international number"
+        )
+    return phonenumbers.format_number(parsed, PhoneNumberFormat.E164)
+
+
+def normalize_optional_phone_number(
+    value: object,
+    *,
+    country: object = None,
+) -> str | None:
+    return _normalize_optional_contact_number(
+        value,
+        country=country,
+        field_label="Phone number",
+    )
+
+
+def normalize_optional_whatsapp_number(
+    value: object,
+    *,
+    country: object = None,
+) -> str | None:
+    """Normalize WhatsApp contact data without assuming a default country."""
+    return _normalize_optional_contact_number(
+        value,
+        country=country,
+        field_label="WhatsApp number",
+    )

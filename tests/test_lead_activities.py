@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.permissions import RoleKey
 from app.models.authorization_audit import AuthorizationAudit
+from app.models.lead import Lead
 from app.models.lead_activity import LeadActivity
 from tests.test_leads import (
     add_membership,
@@ -58,6 +59,7 @@ def test_create_email_activity_and_paginated_timeline(
     assert data["externally_performed"] is True
     assert data["email_delivery_verified"] is False
     assert data["is_system"] is False
+    assert database_session.get(Lead, uuid.UUID(lead["id"])).status == "new"
 
     second = client.post(
         f"/api/leads/{lead['id']}/activities",

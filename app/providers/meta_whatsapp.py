@@ -57,6 +57,7 @@ def normalize_meta_recipient(value: object) -> str:
 
 def safe_meta_error(code: object) -> str:
     normalized = str(code or "meta_rejected")
+    base_code = normalized.split(":", 1)[0]
     known = {
         "131026": "Meta could not deliver to this WhatsApp recipient",
         "131030": "The recipient is not in the permitted test-recipient list",
@@ -68,7 +69,10 @@ def safe_meta_error(code: object) -> str:
         "4": "Meta rate-limited the WhatsApp request",
         "80007": "Meta rate-limited the WhatsApp request",
     }
-    return known.get(normalized, f"Meta rejected the WhatsApp request (code {normalized})")
+    return known.get(
+        base_code,
+        f"Meta rejected the WhatsApp request (code {normalized})",
+    )
 
 
 class MetaWhatsAppProvider:
@@ -135,14 +139,24 @@ class MetaWhatsAppProvider:
     @staticmethod
     def _provider_error(response: httpx.Response) -> MetaWhatsAppRejectedError:
         code: str | None = None
+        subcode: str | None = None
         try:
             error = response.json().get("error", {})
             code = str(error.get("code")) if error.get("code") is not None else None
+            subcode = (
+                str(error.get("error_subcode"))
+                if error.get("error_subcode") is not None
+                else None
+            )
         except (TypeError, ValueError):
             code = None
+            subcode = None
+        normalized = ":".join(
+            value for value in (code, subcode) if value
+        ) or f"http_{response.status_code}"
         return MetaWhatsAppRejectedError(
-            code=code or f"http_{response.status_code}",
-            safe_message=safe_meta_error(code or f"http_{response.status_code}"),
+            code=normalized,
+            safe_message=safe_meta_error(normalized),
             http_status=response.status_code,
         )
 

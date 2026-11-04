@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.lead_catalogs import LeadStatus
 from app.core.permissions import RoleKey
 from app.core.security import WorkspaceContext
 from app.core.storage import ObjectStorage, ObjectStorageError
@@ -106,7 +107,14 @@ def _selection(
         selected: list[tuple[uuid.UUID, Lead | None]] = []
         for lead_id in unique_ids:
             lead = get_lead(session, context.tenant.id, lead_id)
-            if lead is not None and (_assigned_scope(context) is None or lead.assigned_user_id == context.user.id):
+            if (
+                lead is not None
+                and lead.status != LeadStatus.CONVERTED.value
+                and (
+                    _assigned_scope(context) is None
+                    or lead.assigned_user_id == context.user.id
+                )
+            ):
                 selected.append((lead_id, lead))
             else:
                 selected.append((lead_id, None))

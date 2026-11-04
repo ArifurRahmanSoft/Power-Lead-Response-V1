@@ -311,7 +311,9 @@ def test_rejection_and_ambiguous_acceptance_are_distinct_and_not_retried(
     app.dependency_overrides[get_twilio_whatsapp_provider] = lambda: provider
     try:
         provider.failure = TwilioWhatsAppRejectedError(
-            code="63016", safe_message="An approved WhatsApp template is required"
+            code="63016",
+            safe_message="An approved WhatsApp template is required",
+            http_status=400,
         )
         rejected = client.post(
             f"/api/messages/whatsapp/conversations/{first.id}/reply",
@@ -329,6 +331,13 @@ def test_rejection_and_ambiguous_acceptance_are_distinct_and_not_retried(
 
     assert rejected.json()["data"]["message"]["status"] == "failed"
     assert rejected.json()["data"]["message"]["provider_error_code"] == "63016"
+    rejected_record = database_session.scalar(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.provider_error_code == "63016"
+        )
+    )
+    assert rejected_record is not None
+    assert rejected_record.provider_http_status == 400
     assert unknown.json()["data"]["message"]["status"] == "unknown"
     assert unknown.json()["data"]["message"]["provider_error_code"] == "acceptance_unknown"
     assert len(provider.sent) == 2

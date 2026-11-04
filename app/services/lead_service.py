@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.lead_catalogs import ConsentStatus, LEAD_STATUS_TRANSITIONS, LeadSource, LeadStatus
+from app.core.lead_catalogs import LEAD_STATUS_TRANSITIONS, LeadSource, LeadStatus
 from app.core.permissions import PermissionKey, RoleKey
 from app.core.security import WorkspaceContext
 from app.models.lead import Lead
@@ -28,7 +28,13 @@ from app.repositories.lead_assignment_repository import (
 )
 from app.repositories.lead_task_repository import lock_open_tasks_for_lead
 from app.repositories.workspace_repository import add_authorization_audit
-from app.schemas.lead import LeadCreateRequest, LeadFields, LeadFilterParams, LeadUpdateRequest
+from app.schemas.lead import (
+    LeadCreateRequest,
+    LeadFields,
+    LeadFilterParams,
+    LeadUpdateRequest,
+    validation_errors,
+)
 from app.utils.lead_normalization import country_name_to_code
 
 
@@ -55,6 +61,12 @@ class LeadAssignmentDispositionError(Exception):
 
 class LeadTransitionError(Exception):
     pass
+
+
+class LeadFieldValidationError(Exception):
+    def __init__(self, errors: list[dict[str, str]]) -> None:
+        self.errors = errors
+        super().__init__("Invalid lead data")
 
 
 class LeadExplicitConversionRequiredError(Exception):
@@ -367,7 +379,7 @@ def update_lead(
     try:
         validated_changes = _validated_combined_values(lead, changes)
     except ValidationError as exception:
-        raise LeadTransitionError(str(exception)) from exception
+        raise LeadFieldValidationError(validation_errors(exception)) from exception
     for field in ("status", "assigned_user_id"):
         if field in changes:
             validated_changes[field] = changes[field]

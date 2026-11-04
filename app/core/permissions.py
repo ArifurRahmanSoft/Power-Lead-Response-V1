@@ -33,6 +33,8 @@ class PermissionKey(StrEnum):
     LEADS_ASSIGN = "leads.assign"
     LEADS_STATUS = "leads.status"
     CUSTOMERS_VIEW = "customers.view"
+    CUSTOMERS_CREATE = "customers.create"
+    CUSTOMERS_UPDATE = "customers.update"
     CUSTOMERS_CONVERT = "customers.convert"
     WORKFLOWS_VIEW = "workflows.view"
     WORKFLOWS_CREATE = "workflows.create"
@@ -97,6 +99,8 @@ ROLE_PERMISSIONS: dict[RoleKey, frozenset[PermissionKey]] = {
             PermissionKey.LEADS_ASSIGN,
             PermissionKey.LEADS_STATUS,
             PermissionKey.CUSTOMERS_VIEW,
+            PermissionKey.CUSTOMERS_CREATE,
+            PermissionKey.CUSTOMERS_UPDATE,
             PermissionKey.CUSTOMERS_CONVERT,
             PermissionKey.WORKFLOWS_VIEW,
             PermissionKey.WORKFLOWS_CREATE,

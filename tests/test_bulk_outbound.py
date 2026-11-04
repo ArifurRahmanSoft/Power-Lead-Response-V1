@@ -92,6 +92,15 @@ def test_all_matching_is_server_resolved_and_reports_blocked_leads(
     tenant, user, first, sender, template, _, headers = setup(client, database_session)
     first.company = "Acme"
     blocked = add_lead(database_session, tenant.id, user.id, first_name="Blocked", email="blocked@example.com", consent="withdrawn", company="Acme")
+    converted = add_lead(
+        database_session,
+        tenant.id,
+        user.id,
+        first_name="Converted",
+        email="converted@example.com",
+        company="Acme",
+    )
+    converted.status = "converted"
     add_lead(database_session, tenant.id, user.id, first_name="Other", email="other@example.com", company="Other")
     database_session.commit()
     response = client.post("/api/mail/batches/preview", headers=headers, json={
@@ -116,17 +125,32 @@ def test_duplicate_recipient_and_inaccessible_selection_are_explicit(
 ) -> None:
     tenant, user, first, sender, template, _, headers = setup(client, database_session)
     duplicate = add_lead(database_session, tenant.id, user.id, first_name="Duplicate", email="ARIF@example.com")
+    converted = add_lead(
+        database_session,
+        tenant.id,
+        user.id,
+        first_name="Converted",
+        email="converted-selected@example.com",
+    )
+    converted.status = "converted"
+    database_session.commit()
     unknown_id = uuid.uuid4()
     data = bulk_preview(
         client, headers, sender.id, template.id,
-        lead_ids=[str(first.id), str(duplicate.id), str(unknown_id)],
+        lead_ids=[
+            str(first.id),
+            str(duplicate.id),
+            str(converted.id),
+            str(unknown_id),
+        ],
     )
-    assert data["batch"]["selection_count"] == 3
+    assert data["batch"]["selection_count"] == 4
     assert data["batch"]["eligible_count"] == 0
-    assert data["batch"]["blocked_count"] == 3
+    assert data["batch"]["blocked_count"] == 4
     codes = {item["requested_lead_id"]: item["exclusion_code"] for item in data["items"]}
     assert codes[str(first.id)] == "duplicate_recipient"
     assert codes[str(duplicate.id)] == "duplicate_recipient"
+    assert codes[str(converted.id)] == "not_accessible"
     assert codes[str(unknown_id)] == "not_accessible"
 
 

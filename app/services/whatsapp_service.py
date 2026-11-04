@@ -575,10 +575,12 @@ def _persist_reply_outcome(
     elif isinstance(error, TwilioWhatsAppRejectedError):
         message.status = "failed"
         message.provider_error_code = error.code
+        message.provider_http_status = error.http_status
         message.failure_reason = error.safe_message
     elif isinstance(error, TwilioWhatsAppConfigurationError):
         message.status = "failed"
         message.provider_error_code = error.code
+        message.provider_http_status = error.http_status
         message.failure_reason = error.safe_message
     else:
         message.status = "unknown"

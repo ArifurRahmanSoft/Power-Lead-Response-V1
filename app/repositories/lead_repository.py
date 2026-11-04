@@ -17,6 +17,7 @@ from app.models.membership import TenantMembership
 from app.models.user import User
 from app.models.outbound_message import OutboundMessage
 from app.models.sms_message import SmsMessage
+from app.core.lead_catalogs import LeadStatus
 from app.schemas.lead import LeadFilterParams
 from app.utils.lead_normalization import country_name_to_code
 
@@ -90,7 +91,11 @@ def lead_filter_conditions(
     filters: LeadFilterParams,
     assigned_scope_user_id: uuid.UUID | None,
 ) -> list[Any]:
-    conditions: list[Any] = [Lead.tenant_id == tenant_id, Lead.deleted_at.is_(None)]
+    conditions: list[Any] = [
+        Lead.tenant_id == tenant_id,
+        Lead.deleted_at.is_(None),
+        Lead.status != LeadStatus.CONVERTED.value,
+    ]
     if assigned_scope_user_id is not None:
         conditions.append(Lead.assigned_user_id == assigned_scope_user_id)
     if filters.search:
@@ -275,6 +280,7 @@ def list_service_options(
     conditions = [
         Lead.tenant_id == tenant_id,
         Lead.deleted_at.is_(None),
+        Lead.status != LeadStatus.CONVERTED.value,
         Lead.service_requested.is_not(None),
         func.length(trimmed_service) > 0,
     ]

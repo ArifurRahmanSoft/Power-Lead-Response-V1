@@ -1,7 +1,7 @@
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -9,15 +9,19 @@ from app.core.permissions import PermissionKey
 from app.core.security import WorkspaceContext, require_permission
 from app.schemas.customer import (
     CustomerData,
+    CustomerCreateRequest,
     CustomerDetailData,
     CustomerDetailResponse,
     CustomerListData,
     CustomerListResponse,
+    CustomerResponse,
+    CustomerUpdateRequest,
     LeadConversionData,
     LeadConversionRequest,
     LeadConversionResponse,
     LeadConversionResponseData,
 )
+from app.schemas.lead import LeadData, LeadEngageRequest, LeadResponse
 from app.services.customer_service import (
     CustomerConversionConflictError,
     CustomerConversionLeadNotFoundError,
@@ -25,9 +29,16 @@ from app.services.customer_service import (
     CustomerConversionStateError,
     CustomerDuplicateError,
     CustomerNotFoundError,
+    CustomerWriteConflictError,
+    CustomerWritePermissionError,
+    CustomerWriteValidationError,
     convert_lead_to_customer,
+    create_customer,
     get_customer_detail,
     get_customers,
+    lead_lifecycle_capabilities,
+    mark_lead_engaged,
+    update_customer,
 )
 
 lead_conversion_router = APIRouter()
@@ -42,6 +53,18 @@ def _raise_customer_error(exception: Exception) -> None:
         raise HTTPException(status_code=404, detail="Customer or lead not found") from exception
     if isinstance(exception, CustomerConversionPermissionError):
         raise HTTPException(status_code=403, detail="Customer operation is not authorized") from exception
+    if isinstance(exception, CustomerWritePermissionError):
+        raise HTTPException(status_code=403, detail="Customer operation is not authorized") from exception
+    if isinstance(exception, CustomerWriteConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail="Customer was modified by another request",
+        ) from exception
+    if isinstance(exception, CustomerWriteValidationError):
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exception.field, "message": exception.message},
+        ) from exception
     if isinstance(exception, CustomerConversionConflictError):
         raise HTTPException(
             status_code=409,
@@ -53,7 +76,10 @@ def _raise_customer_error(exception: Exception) -> None:
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "A customer with this email already exists; retry with link_existing",
+                "message": (
+                    "A customer with this email already exists; use the existing customer "
+                    "or explicitly link it during lead conversion"
+                ),
                 "existing_customer_id": str(exception.customer.id),
             },
         ) from exception
@@ -69,7 +95,7 @@ def convert_lead_route(
     payload: LeadConversionRequest,
     context: Annotated[
         WorkspaceContext,
-        Depends(require_permission(PermissionKey.CUSTOMERS_CONVERT)),
+        Depends(require_permission(PermissionKey.LEADS_VIEW)),
     ],
     database_session: Annotated[Session, Depends(get_db)],
 ) -> LeadConversionResponse:
@@ -95,6 +121,39 @@ def convert_lead_route(
             conversion=LeadConversionData.model_validate(result.conversion),
             idempotent_replay=result.idempotent_replay,
         ),
+    )
+
+
+@lead_conversion_router.post(
+    "/{lead_id}/engage",
+    response_model=LeadResponse,
+)
+def mark_lead_engaged_route(
+    lead_id: uuid.UUID,
+    payload: LeadEngageRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.LEADS_VIEW)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> LeadResponse:
+    try:
+        lead = mark_lead_engaged(
+            database_session,
+            context,
+            lead_id,
+            payload,
+        )
+    except Exception as exception:
+        _raise_customer_error(exception)
+        raise
+    data = LeadData.model_validate(lead).model_copy(
+        update=lead_lifecycle_capabilities(context, lead)
+    )
+    return LeadResponse(
+        success=True,
+        message="Lead marked engaged",
+        data=data,
     )
 
 
@@ -124,6 +183,58 @@ def list_customers_route(
             size=size,
             total=result.total,
         ),
+    )
+
+
+@customer_router.post(
+    "",
+    response_model=CustomerResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_customer_route(
+    payload: CustomerCreateRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.CUSTOMERS_CREATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> CustomerResponse:
+    try:
+        customer = create_customer(database_session, context, payload)
+    except Exception as exception:
+        _raise_customer_error(exception)
+        raise
+    return CustomerResponse(
+        success=True,
+        message="Customer created",
+        data=CustomerData.model_validate(customer),
+    )
+
+
+@customer_router.patch("/{customer_id}", response_model=CustomerResponse)
+def update_customer_route(
+    customer_id: uuid.UUID,
+    payload: CustomerUpdateRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.CUSTOMERS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> CustomerResponse:
+    try:
+        customer = update_customer(
+            database_session,
+            context,
+            customer_id,
+            payload,
+        )
+    except Exception as exception:
+        _raise_customer_error(exception)
+        raise
+    return CustomerResponse(
+        success=True,
+        message="Customer updated",
+        data=CustomerData.model_validate(customer),
     )
 
 

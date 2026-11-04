@@ -385,6 +385,10 @@ def test_import_partial_failure_limits_template_and_permissions(
     assert sample["company_website"] == "google.com"
     assert sample["country"] == "Bangladesh"
     assert sample["service_requested"] == "Website Design"
+    assert sample["WhatsApp Number"] == "+8801712345678"
+    lead_headers = [cell.value for cell in workbook["Leads"][1]]
+    assert "WhatsApp Number" in lead_headers
+    assert "consent_evidence" not in lead_headers
 
     file_bytes = workbook_bytes(
         [lead_payload("first@example.com"), lead_payload("second@example.com")]
@@ -420,6 +424,131 @@ def test_import_partial_failure_limits_template_and_permissions(
     add_membership(database_session, readonly, tenant, roles[RoleKey.READONLY])
     readonly_headers = login_headers(client, readonly)
     assert client.get("/api/leads/import-template", headers=readonly_headers).status_code == 403
+
+
+def test_excel_whatsapp_compatibility_and_text_preservation(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    _, _, _, headers = owner_setup(client, database_session)
+
+    template_response = client.get("/api/leads/import-template", headers=headers)
+    assert template_response.status_code == 200
+    template = load_workbook(BytesIO(template_response.content), read_only=False)
+    headers_row = [cell.value for cell in template["Leads"][1]]
+    whatsapp_column = headers_row.index("WhatsApp Number") + 1
+    assert template["Leads"].cell(2, whatsapp_column).number_format == "@"
+
+    valid_workbook = Workbook()
+    valid_sheet = valid_workbook.active
+    valid_sheet.title = "Leads"
+    valid_sheet.append(
+        [
+            "first_name",
+            "last_name",
+            "email",
+            "country",
+            "WhatsApp Number",
+            "Consent Evidence",
+            "consent_status",
+        ]
+    )
+    valid_sheet.append(
+        [
+            "Import",
+            "Person",
+            "whatsapp-import@example.com",
+            "Bangladesh",
+            "01712345678",
+            "Older client evidence",
+            "granted",
+        ]
+    )
+    valid_output = BytesIO()
+    valid_workbook.save(valid_output)
+    preview = client.post(
+        "/api/leads/imports/preview",
+        headers=headers,
+        files={
+            "file": (
+                "whatsapp.xlsx",
+                valid_output.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert preview.status_code == 201
+    assert preview.json()["data"]["summary"]["valid"] == 1
+    batch_id = uuid.UUID(preview.json()["data"]["id"])
+    row = database_session.scalar(
+        select(LeadImportRow).where(LeadImportRow.batch_id == batch_id)
+    )
+    assert row.normalized_data["whatsapp_number"] == "+8801712345678"
+    assert row.normalized_data["consent_evidence"] == "Older client evidence"
+    committed = client.post(f"/api/leads/imports/{batch_id}/commit", headers=headers)
+    assert committed.status_code == 200
+    imported = database_session.scalar(
+        select(Lead).where(Lead.email == "whatsapp-import@example.com")
+    )
+    assert imported.whatsapp_number == "+8801712345678"
+    assert imported.consent_evidence == "Older client evidence"
+
+    numeric_workbook = Workbook()
+    numeric_sheet = numeric_workbook.active
+    numeric_sheet.title = "Leads"
+    numeric_sheet.append(
+        ["first_name", "last_name", "email", "country", "WhatsApp Number"]
+    )
+    numeric_sheet.append(
+        ["Numeric", "Value", "numeric-whatsapp@example.com", "Bangladesh", 1712345678]
+    )
+    numeric_output = BytesIO()
+    numeric_workbook.save(numeric_output)
+    numeric_preview = client.post(
+        "/api/leads/imports/preview",
+        headers=headers,
+        files={
+            "file": (
+                "numeric-whatsapp.xlsx",
+                numeric_output.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert numeric_preview.status_code == 201
+    assert numeric_preview.json()["data"]["summary"]["invalid"] == 1
+    numeric_errors = client.get(
+        f"/api/leads/imports/{numeric_preview.json()['data']['id']}/errors",
+        headers=headers,
+    )
+    assert numeric_errors.status_code == 200
+    assert numeric_errors.json()["data"]["items"][0]["errors"] == [
+        {
+            "field": "whatsapp_number",
+            "message": "WhatsApp number must be stored as text to preserve formatting",
+        }
+    ]
+
+    old_workbook = Workbook()
+    old_sheet = old_workbook.active
+    old_sheet.title = "Leads"
+    old_sheet.append(["first_name", "last_name", "email", "Consent Evidence"])
+    old_sheet.append(["Old", "Template", "old-consent@example.com", "Legacy evidence"])
+    old_output = BytesIO()
+    old_workbook.save(old_output)
+    old_preview = client.post(
+        "/api/leads/imports/preview",
+        headers=headers,
+        files={
+            "file": (
+                "old-template.xlsx",
+                old_output.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert old_preview.status_code == 201
+    assert old_preview.json()["data"]["summary"]["valid"] == 1
 
 
 @pytest.mark.parametrize(
@@ -502,6 +631,136 @@ def test_country_names_aliases_codes_and_unknown_values() -> None:
                     "country": invalid_country,
                 }
             )
+
+
+@pytest.mark.parametrize(
+    ("raw_number", "country", "normalized"),
+    [
+        ("+8801712345678", None, "+8801712345678"),
+        ("+1 (415) 555-2671", None, "+14155552671"),
+        ("01712-345678", "Bangladesh", "+8801712345678"),
+    ],
+)
+def test_whatsapp_number_normalization(
+    raw_number: str,
+    country: str | None,
+    normalized: str,
+) -> None:
+    lead = LeadFields.model_validate(
+        {
+            "first_name": "Jane",
+            "last_name": "Doe",
+            "email": "jane@example.com",
+            "country": country,
+            "whatsapp_number": raw_number,
+        }
+    )
+    assert lead.whatsapp_number == normalized
+
+
+@pytest.mark.parametrize(
+    ("raw_number", "country"),
+    [
+        ("01712345678", None),
+        ("not-a-number", "Bangladesh"),
+        ("1.712345678E+10", "Bangladesh"),
+        ("whatsapp:+8801712345678", None),
+    ],
+)
+def test_whatsapp_number_rejects_ambiguous_or_invalid_values(
+    raw_number: str,
+    country: str | None,
+) -> None:
+    with pytest.raises(ValidationError):
+        LeadFields.model_validate(
+            {
+                "first_name": "Jane",
+                "last_name": "Doe",
+                "email": "jane@example.com",
+                "country": country,
+                "whatsapp_number": raw_number,
+            }
+        )
+
+
+def test_whatsapp_crud_partial_updates_and_optional_consent_evidence(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    _, _, _, headers = owner_setup(client, database_session)
+    created = client.post(
+        "/api/leads",
+        headers=headers,
+        json=lead_payload(
+            "whatsapp@example.com",
+            whatsapp_number="01712 345678",
+            consent_status="granted",
+        ),
+    )
+    assert created.status_code == 201
+    lead = created.json()["data"]
+    assert lead["whatsapp_number"] == "+8801712345678"
+    assert lead["consent_status"] == "granted"
+    assert lead["consent_evidence"] is None
+
+    with_evidence = client.patch(
+        f"/api/leads/{lead['id']}",
+        headers=headers,
+        json={
+            "row_version": lead["row_version"],
+            "consent_evidence": "Historic form record",
+        },
+    )
+    assert with_evidence.status_code == 200
+    lead = with_evidence.json()["data"]
+
+    omitted_fields = client.patch(
+        f"/api/leads/{lead['id']}",
+        headers=headers,
+        json={"row_version": lead["row_version"], "company": "Updated Company"},
+    )
+    assert omitted_fields.status_code == 200
+    lead = omitted_fields.json()["data"]
+    assert lead["whatsapp_number"] == "+8801712345678"
+    assert lead["consent_evidence"] == "Historic form record"
+
+    cleared = client.patch(
+        f"/api/leads/{lead['id']}",
+        headers=headers,
+        json={"row_version": lead["row_version"], "whatsapp_number": None},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["data"]["whatsapp_number"] is None
+    assert cleared.json()["data"]["consent_evidence"] == "Historic form record"
+
+    invalid_update = client.patch(
+        f"/api/leads/{lead['id']}",
+        headers=headers,
+        json={
+            "row_version": cleared.json()["data"]["row_version"],
+            "country": None,
+            "whatsapp_number": "01712345678",
+        },
+    )
+    assert invalid_update.status_code == 422
+    assert invalid_update.json()["detail"]["errors"][0]["field"] == (
+        "whatsapp_number"
+    )
+
+    ambiguous = client.post(
+        "/api/leads",
+        headers=headers,
+        json=lead_payload(
+            "ambiguous-whatsapp@example.com",
+            country=None,
+            whatsapp_number="01712345678",
+        ),
+    )
+    assert ambiguous.status_code == 422
+    assert any(
+        error["field"] == "whatsapp_number"
+        for error in ambiguous.json()["errors"]
+    )
 
 
 def test_crud_and_excel_share_normalization_and_old_files_still_import(

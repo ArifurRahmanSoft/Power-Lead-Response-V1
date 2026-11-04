@@ -72,6 +72,7 @@ class Lead(Base):
     x_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     github_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    whatsapp_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
     city: Mapped[str | None] = mapped_column(String(120), nullable=True)
     state: Mapped[str | None] = mapped_column(String(120), nullable=True)
     company_website: Mapped[str | None] = mapped_column(String(2048), nullable=True)

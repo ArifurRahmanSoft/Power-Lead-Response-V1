@@ -4,6 +4,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -23,6 +24,7 @@ from app.providers.meta_whatsapp import (
     MetaWhatsAppRejectedError,
     MetaWhatsAppResult,
     get_meta_whatsapp_provider,
+    safe_meta_error,
 )
 from tests.test_outbound_messages import setup
 
@@ -509,7 +511,9 @@ def test_definitive_rejection_and_uncertain_outcome(
     app.dependency_overrides[get_meta_whatsapp_provider] = lambda: provider
     try:
         provider.failure = MetaWhatsAppRejectedError(
-            code="131030", safe_message="The recipient is not in the permitted test-recipient list"
+            code="131030",
+            safe_message="The recipient is not in the permitted test-recipient list",
+            http_status=400,
         )
         rejected = client.post(
             "/api/messages/meta/whatsapp/send",
@@ -538,8 +542,36 @@ def test_definitive_rejection_and_uncertain_outcome(
         app.dependency_overrides.pop(get_meta_whatsapp_provider, None)
     assert rejected.json()["data"]["message"]["status"] == "failed"
     assert rejected.json()["data"]["message"]["provider_error_code"] == "131030"
+    rejected_record = database_session.scalar(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.provider_error_code == "131030"
+        )
+    )
+    assert rejected_record is not None
+    assert rejected_record.provider_http_status == 400
     assert unknown.json()["data"]["message"]["status"] == "unknown"
     assert unknown.json()["data"]["message"]["provider_error_code"] == "acceptance_unknown"
+
+
+def test_meta_provider_error_retains_subcode_without_exposing_provider_text() -> None:
+    response = httpx.Response(
+        401,
+        request=httpx.Request("POST", "https://graph.facebook.com/v26.0/messages"),
+        json={
+            "error": {
+                "message": "raw provider detail must not be exposed",
+                "code": 190,
+                "error_subcode": 463,
+            }
+        },
+    )
+
+    error = MetaWhatsAppProvider._provider_error(response)
+
+    assert error.http_status == 401
+    assert error.code == "190:463"
+    assert error.safe_message == safe_meta_error("190:463")
+    assert "raw provider detail" not in error.safe_message
 
 
 

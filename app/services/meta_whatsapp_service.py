@@ -655,6 +655,7 @@ async def send_message(
             ):
                 stored.status = "failed"
                 stored.provider_error_code = provider_error.code
+                stored.provider_http_status = provider_error.http_status
                 stored.failure_reason = provider_error.safe_message
             else:
                 stored.status = "unknown"

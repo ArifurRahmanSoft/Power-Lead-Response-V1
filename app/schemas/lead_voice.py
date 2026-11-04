@@ -5,10 +5,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.lead_catalogs import CompanySize, RevenuePeriod
 
 GROQ_NULLABLE_LEAD_FIELDS = (
-    "first_name",
-    "last_name",
+    "explicit_first_name",
+    "explicit_last_name",
+    "generic_full_name",
     "email",
     "phone",
+    "whatsapp_number",
     "country",
     "designation",
     "company",
@@ -35,6 +37,7 @@ GROQ_LEAD_EXTRACTION_JSON_SCHEMA = {
             field: {"type": ["string", "null"]}
             for field in GROQ_NULLABLE_LEAD_FIELDS
         },
+        "whatsapp_same_as_phone": {"type": "boolean"},
         "name_split_uncertain": {"type": "boolean"},
         "review_warnings": {
             "type": "array",
@@ -43,6 +46,7 @@ GROQ_LEAD_EXTRACTION_JSON_SCHEMA = {
     },
     "required": [
         *GROQ_NULLABLE_LEAD_FIELDS,
+        "whatsapp_same_as_phone",
         "name_split_uncertain",
         "review_warnings",
     ],
@@ -55,10 +59,12 @@ class GroqLeadExtraction(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    first_name: str | None
-    last_name: str | None
+    explicit_first_name: str | None
+    explicit_last_name: str | None
+    generic_full_name: str | None
     email: str | None
     phone: str | None
+    whatsapp_number: str | None
     country: str | None
     designation: str | None
     company: str | None
@@ -77,6 +83,7 @@ class GroqLeadExtraction(BaseModel):
     github_url: str | None
     service_requested: str | None
     notes: str | None
+    whatsapp_same_as_phone: bool
     name_split_uncertain: bool
     review_warnings: list[str] = Field(max_length=20)
 
@@ -88,6 +95,7 @@ class LeadVoiceDraft(BaseModel):
     last_name: str | None = None
     email: str | None = None
     phone: str | None = None
+    whatsapp_number: str | None = None
     country: str | None = None
     designation: str | None = None
     company: str | None = None

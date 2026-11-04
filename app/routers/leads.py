@@ -87,6 +87,7 @@ from app.services.lead_service import (
     LeadConflictError,
     LeadDuplicateError,
     LeadExplicitConversionRequiredError,
+    LeadFieldValidationError,
     LeadNotFoundError,
     LeadPermissionError,
     LeadScopeError,
@@ -99,12 +100,15 @@ from app.services.lead_service import (
     get_service_filter_options,
     update_lead,
 )
+from app.services.customer_service import lead_lifecycle_capabilities
 
 router = APIRouter()
 
 
-def _lead_data(lead: Lead) -> LeadData:
-    return LeadData.model_validate(lead)
+def _lead_data(lead: Lead, context: WorkspaceContext) -> LeadData:
+    return LeadData.model_validate(lead).model_copy(
+        update=lead_lifecycle_capabilities(context, lead)
+    )
 
 
 def _batch_data(batch: LeadImportBatch) -> LeadImportBatchData:
@@ -151,6 +155,14 @@ def _raise_lead_error(exception: Exception) -> None:
         raise HTTPException(status_code=400, detail=str(exception)) from exception
     if isinstance(exception, LeadTransitionError):
         raise HTTPException(status_code=400, detail="Invalid lead state or field combination") from exception
+    if isinstance(exception, LeadFieldValidationError):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Invalid lead data",
+                "errors": exception.errors,
+            },
+        ) from exception
     if isinstance(exception, LeadExplicitConversionRequiredError):
         raise HTTPException(
             status_code=400,
@@ -289,7 +301,11 @@ def create_lead_route(
     except Exception as exception:
         _raise_lead_error(exception)
         raise
-    return LeadResponse(success=True, message="Lead created", data=_lead_data(lead))
+    return LeadResponse(
+        success=True,
+        message="Lead created",
+        data=_lead_data(lead, context),
+    )
 
 
 @router.get(
@@ -477,7 +493,7 @@ def list_leads_route(
     return LeadListResponse(
         success=True,
         data=LeadListData(
-            items=[_lead_data(lead) for lead in result.items],
+            items=[_lead_data(lead, context) for lead in result.items],
             page=page,
             size=size,
             total=result.total,
@@ -588,7 +604,7 @@ def get_lead_route(
     except Exception as exception:
         _raise_lead_error(exception)
         raise
-    return LeadResponse(success=True, data=_lead_data(lead))
+    return LeadResponse(success=True, data=_lead_data(lead, context))
 
 
 @router.patch("/{lead_id}", response_model=LeadResponse)
@@ -606,7 +622,11 @@ def update_lead_route(
     except Exception as exception:
         _raise_lead_error(exception)
         raise
-    return LeadResponse(success=True, message="Lead updated", data=_lead_data(lead))
+    return LeadResponse(
+        success=True,
+        message="Lead updated",
+        data=_lead_data(lead, context),
+    )
 
 
 @router.delete("/{lead_id}", response_model=LeadDeleteResponse)

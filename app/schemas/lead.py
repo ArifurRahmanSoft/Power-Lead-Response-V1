@@ -8,6 +8,7 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -22,7 +23,11 @@ from app.core.lead_catalogs import (
     LeadPriority,
     RevenuePeriod,
 )
-from app.utils.lead_normalization import normalize_country_name, normalize_optional_url
+from app.utils.lead_normalization import (
+    normalize_country_name,
+    normalize_optional_url,
+    normalize_optional_whatsapp_number,
+)
 
 URL_FIELDS = (
     "linkedin_url",
@@ -36,6 +41,7 @@ TEXT_FIELDS = (
     "designation",
     "company",
     "phone",
+    "whatsapp_number",
     "city",
     "state",
     "industry",
@@ -62,6 +68,7 @@ class LeadFields(BaseModel):
     x_url: str | None = Field(default=None, max_length=2048)
     github_url: str | None = Field(default=None, max_length=2048)
     phone: str | None = Field(default=None, max_length=80)
+    whatsapp_number: str | None = Field(default=None, max_length=32)
     city: str | None = Field(default=None, max_length=120)
     state: str | None = Field(default=None, max_length=120)
     company_website: str | None = Field(default=None, max_length=2048)
@@ -108,6 +115,18 @@ class LeadFields(BaseModel):
     def validate_country(cls, value: object) -> object:
         return normalize_country_name(value)
 
+    @field_validator("whatsapp_number")
+    @classmethod
+    def normalize_whatsapp_number(
+        cls,
+        value: str | None,
+        info: ValidationInfo,
+    ) -> str | None:
+        return normalize_optional_whatsapp_number(
+            value,
+            country=info.data.get("country"),
+        )
+
     @field_validator("revenue_currency", mode="before")
     @classmethod
     def validate_currency(cls, value: object) -> object:
@@ -119,7 +138,7 @@ class LeadFields(BaseModel):
         return code
 
     @model_validator(mode="after")
-    def validate_revenue_and_consent(self) -> Self:
+    def validate_revenue(self) -> Self:
         revenue_values = (self.revenue_amount, self.revenue_currency, self.revenue_period)
         if any(value is not None for value in revenue_values) and not all(
             value is not None for value in revenue_values
@@ -127,16 +146,26 @@ class LeadFields(BaseModel):
             raise ValueError(
                 "Revenue amount, currency, and period must be provided together"
             )
-        if self.consent_status == ConsentStatus.GRANTED and not (
-            self.consent_evidence or self.consent_reference
-        ):
-            raise ValueError("Granted consent requires evidence or a reference")
         return self
 
 
 class LeadCreateRequest(LeadFields):
     status: LeadStatus = LeadStatus.NEW
     assigned_user_id: uuid.UUID | None = None
+
+
+class LeadEngageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    row_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def clean_reason(cls, value: object) -> object:
+        if isinstance(value, str):
+            return " ".join(value.strip().split())
+        return value
 
 
 class LeadUpdateRequest(BaseModel):
@@ -156,6 +185,7 @@ class LeadUpdateRequest(BaseModel):
     x_url: str | None = Field(default=None, max_length=2048)
     github_url: str | None = Field(default=None, max_length=2048)
     phone: str | None = Field(default=None, max_length=80)
+    whatsapp_number: str | None = Field(default=None, max_length=32)
     city: str | None = Field(default=None, max_length=120)
     state: str | None = Field(default=None, max_length=120)
     company_website: str | None = Field(default=None, max_length=2048)
@@ -274,6 +304,7 @@ class LeadData(BaseModel):
     x_url: str | None
     github_url: str | None
     phone: str | None
+    whatsapp_number: str | None
     city: str | None
     state: str | None
     company_website: str | None
@@ -301,6 +332,10 @@ class LeadData(BaseModel):
         default_factory=lambda: LeadEmailSummary(state="not_contacted_by_email", attempt_count=0)
     )
     sms_summary: LeadSmsSummary = Field(default_factory=LeadSmsSummary)
+    can_convert_to_customer: bool = False
+    conversion_blocking_reason: str | None = None
+    can_mark_engaged: bool = False
+    engagement_blocking_reason: str | None = None
 
     @field_validator("country", mode="before")
     @classmethod

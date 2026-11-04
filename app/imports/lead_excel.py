@@ -35,6 +35,7 @@ CANONICAL_COLUMNS = (
     "x_url",
     "github_url",
     "phone",
+    "whatsapp_number",
     "city",
     "state",
     "company_website",
@@ -51,7 +52,11 @@ CANONICAL_COLUMNS = (
     "priority",
 )
 REQUIRED_COLUMNS = frozenset({"first_name", "last_name", "email"})
-TEXT_ONLY_COLUMNS = frozenset({"phone"})
+TEXT_ONLY_COLUMNS = frozenset({"phone", "whatsapp_number"})
+TEMPLATE_COLUMNS = tuple(
+    column for column in CANONICAL_COLUMNS if column != "consent_evidence"
+)
+TEMPLATE_HEADER_LABELS = {"whatsapp_number": "WhatsApp Number"}
 
 
 class LeadImportFileError(Exception):
@@ -105,23 +110,32 @@ def build_import_template() -> bytes:
     instructions.append(["Country", "Country name, for example Bangladesh or United States; ISO codes remain accepted"])
     instructions.append(["URLs", "Bare domains such as google.com are accepted and stored as https://google.com"])
     instructions.append(["Revenue", "amount, ISO 4217 currency, and period must be supplied together"])
-    instructions.append(["Phone", "Keep the cell formatted as Text to preserve leading zero or +"])
-    instructions.append(["Consent", "Granted consent requires evidence or a reference; importing never sends messages"])
+    instructions.append(["Phone", "Keep phone cells formatted as Text to preserve leading zero or +"])
+    instructions.append([
+        "WhatsApp Number",
+        "Optional. Use an international number, or provide Country for a local number; keep the cell formatted as Text",
+    ])
+    instructions.append([
+        "Consent",
+        "Consent evidence is optional. Importing never grants consent or sends messages",
+    ])
     instructions["A1"].font = Font(bold=True, size=14)
 
     header_fill = PatternFill("solid", fgColor="D9EAF7")
     for sheet in (leads, sample):
-        sheet.append(list(CANONICAL_COLUMNS))
+        sheet.append([TEMPLATE_HEADER_LABELS.get(field, field) for field in TEMPLATE_COLUMNS])
         sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = f"A1:{sheet.cell(1, len(CANONICAL_COLUMNS)).column_letter}1"
+        sheet.auto_filter.ref = f"A1:{sheet.cell(1, len(TEMPLATE_COLUMNS)).column_letter}1"
         for cell in sheet[1]:
             cell.font = Font(bold=True)
             cell.fill = header_fill
-        for index, field in enumerate(CANONICAL_COLUMNS, start=1):
-            sheet.column_dimensions[sheet.cell(1, index).column_letter].width = max(14, len(field) + 2)
-        phone_column = CANONICAL_COLUMNS.index("phone") + 1
-        for row in range(2, 5002):
-            sheet.cell(row, phone_column).number_format = "@"
+        for index, field in enumerate(TEMPLATE_COLUMNS, start=1):
+            label = TEMPLATE_HEADER_LABELS.get(field, field)
+            sheet.column_dimensions[sheet.cell(1, index).column_letter].width = max(14, len(label) + 2)
+        for text_field in ("phone", "whatsapp_number"):
+            text_column = TEMPLATE_COLUMNS.index(text_field) + 1
+            for row in range(2, 5002):
+                sheet.cell(row, text_column).number_format = "@"
 
     sample_values = {
         "first_name": "Sample",
@@ -131,6 +145,7 @@ def build_import_template() -> bytes:
         "country": "Bangladesh",
         "email_status": "unknown",
         "phone": "+8801000000000",
+        "whatsapp_number": "+8801712345678",
         "company_website": "google.com",
         "service_requested": "Website Design",
         "company_size": "11_50",
@@ -140,8 +155,13 @@ def build_import_template() -> bytes:
         "consent_status": "unknown",
         "priority": "normal",
     }
-    for column, field in enumerate(CANONICAL_COLUMNS, start=1):
-        sample.cell(2, column, _safe_cell(sample_values.get(field, "")))
+    for column, field in enumerate(TEMPLATE_COLUMNS, start=1):
+        sample_value = sample_values.get(field, "")
+        sample.cell(
+            2,
+            column,
+            sample_value if field in TEXT_ONLY_COLUMNS else _safe_cell(sample_value),
+        )
 
     catalog_values = {
         "email_status": [item.value for item in EmailStatus],
@@ -156,7 +176,7 @@ def build_import_template() -> bytes:
         catalogs.cell(1, column, name)
         for row, value in enumerate(values, start=2):
             catalogs.cell(row, column, value)
-        target_column = CANONICAL_COLUMNS.index(name) + 1
+        target_column = TEMPLATE_COLUMNS.index(name) + 1
         letter = catalogs.cell(1, column).column_letter
         _add_list_validation(leads, target_column, f"Catalogs!${letter}$2:${letter}${len(values) + 1}")
     catalogs.sheet_state = "hidden"
@@ -257,7 +277,11 @@ def parse_workbook(
                 errors.append(
                     {
                         "field": canonical,
-                        "message": "Phone must be stored as text to preserve formatting",
+                        "message": (
+                            "WhatsApp number must be stored as text to preserve formatting"
+                            if canonical == "whatsapp_number"
+                            else "Phone must be stored as text to preserve formatting"
+                        ),
                     }
                 )
                 continue

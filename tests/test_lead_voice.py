@@ -33,7 +33,11 @@ def voice_extraction(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         field: None for field in GroqLeadExtraction.model_fields
     }
-    payload.update(name_split_uncertain=False, review_warnings=[])
+    payload.update(
+        whatsapp_same_as_phone=False,
+        name_split_uncertain=False,
+        review_warnings=[],
+    )
     payload.update(overrides)
     return payload
 
@@ -169,8 +173,7 @@ def test_voice_extract_bangla_mixed_leading_zero_and_missing_fields(
     )
     provider = FakeGroqProvider(
         extraction=voice_extraction(
-            first_name="Arif",
-            last_name="Rahman",
+            generic_full_name="Arif Rahman",
             email=" ARIF@EXAMPLE.COM ",
             phone="01712345678",
             country="Bangladesh",
@@ -198,6 +201,8 @@ def test_voice_extract_bangla_mixed_leading_zero_and_missing_fields(
     assert "untrusted data" in provider.system_prompt
     assert provider.json_schema["additionalProperties"] is False
     assert "service_requested" in provider.json_schema["required"]
+    assert "generic_full_name" in provider.json_schema["required"]
+    assert "whatsapp_number" in provider.json_schema["required"]
     assert database_session.scalar(select(func.count(Lead.id))) == 0
 
     create_without_create_permission = client.post(
@@ -221,8 +226,8 @@ def test_voice_extract_flags_invalid_fields_and_uncertain_name(
     )
     provider = FakeGroqProvider(
         extraction=voice_extraction(
-            first_name="Arif123",
-            last_name=None,
+            explicit_first_name="Arif123",
+            explicit_last_name=None,
             email="not-an-email",
             phone="01ABC",
             name_split_uncertain=True,
@@ -242,6 +247,238 @@ def test_voice_extract_flags_invalid_fields_and_uncertain_name(
         "phone",
     }
     assert any("split is uncertain" in warning for warning in body["review_warnings"])
+
+
+def test_voice_extract_preserves_explicit_multiword_names(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        transcript="first name Arifur Rahman, last name Parvez",
+        extraction=voice_extraction(
+            explicit_first_name="  Arifur   Rahman ",
+            explicit_last_name=" Parvez ",
+        ),
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["extracted_fields"]["first_name"] == "Arifur Rahman"
+    assert body["extracted_fields"]["last_name"] == "Parvez"
+    assert body["field_errors"] == []
+    assert body["review_warnings"] == []
+
+
+@pytest.mark.parametrize(
+    ("transcript", "generic_name", "expected_first", "expected_last"),
+    [
+        ("name Arif", "Arif", "Arif", None),
+        ("name Arifur Rahman", "Arifur Rahman", "Arifur", "Rahman"),
+        (
+            "name Arifur Rahman Parvez",
+            "Arifur Rahman Parvez",
+            "Arifur",
+            "Rahman Parvez",
+        ),
+        (
+            "নাম আরিফুর রহমান পারভেজ",
+            "আরিফুর রহমান পারভেজ",
+            "আরিফুর",
+            "রহমান পারভেজ",
+        ),
+        (
+            "name Jean-Luc   D'Arcy   Junior",
+            "  Jean-Luc   D'Arcy   Junior  ",
+            "Jean-Luc",
+            "D'Arcy Junior",
+        ),
+    ],
+)
+def test_voice_extract_splits_only_generic_names_deterministically(
+    client: TestClient,
+    database_session: Session,
+    transcript: str,
+    generic_name: str,
+    expected_first: str,
+    expected_last: str | None,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        transcript=transcript,
+        extraction=voice_extraction(generic_full_name=generic_name),
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["extracted_fields"]["first_name"] == expected_first
+    assert body["extracted_fields"]["last_name"] == expected_last
+    assert body["field_errors"] == []
+    assert body["review_warnings"] == []
+
+
+def test_voice_extract_explicit_names_win_over_conflicting_generic_name(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        extraction=voice_extraction(
+            explicit_first_name="Arifur Rahman",
+            explicit_last_name="Parvez",
+            generic_full_name="Different Person",
+        )
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["extracted_fields"]["first_name"] == "Arifur Rahman"
+    assert body["extracted_fields"]["last_name"] == "Parvez"
+    assert any(
+        "conflict with the generic full name" in warning
+        for warning in body["review_warnings"]
+    )
+
+
+def test_voice_extract_name_value_does_not_absorb_later_fields(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        transcript="name Arifur Rahman, email arif@example.com, company Acme",
+        extraction=voice_extraction(
+            generic_full_name="Arifur Rahman",
+            email="arif@example.com",
+            company="Acme",
+        ),
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    fields = response.json()["extracted_fields"]
+    assert fields["first_name"] == "Arifur"
+    assert fields["last_name"] == "Rahman"
+    assert fields["email"] == "arif@example.com"
+    assert fields["company"] == "Acme"
+
+
+def test_voice_extract_keeps_phone_and_explicit_whatsapp_separate(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        transcript=(
+            "mobile 01712345678, WhatsApp +8801812345678, country Bangladesh"
+        ),
+        extraction=voice_extraction(
+            phone="01712345678",
+            whatsapp_number="+8801812345678",
+            country="Bangladesh",
+        ),
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    fields = response.json()["extracted_fields"]
+    assert fields["phone"] == "01712345678"
+    assert fields["whatsapp_number"] == "+8801812345678"
+
+
+def test_voice_extract_copies_mobile_to_whatsapp_only_when_explicitly_requested(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    copied_provider = FakeGroqProvider(
+        transcript="mobile 01712345678, country Bangladesh, WhatsApp same as mobile",
+        extraction=voice_extraction(
+            phone="01712345678",
+            country="Bangladesh",
+            whatsapp_same_as_phone=True,
+        ),
+    )
+    missing_provider = FakeGroqProvider(
+        transcript="mobile 01712345678, country Bangladesh",
+        extraction=voice_extraction(
+            phone="01712345678",
+            country="Bangladesh",
+        ),
+    )
+
+    copied = post_voice(client, headers, copied_provider)
+    missing = post_voice(client, headers, missing_provider)
+
+    assert copied.status_code == 200
+    assert copied.json()["extracted_fields"]["whatsapp_number"] == "+8801712345678"
+    assert missing.status_code == 200
+    assert missing.json()["extracted_fields"]["whatsapp_number"] is None
+
+
+def test_voice_extract_missing_name_and_whatsapp_fields_remain_null(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        transcript="company Acme",
+        extraction=voice_extraction(company="Acme"),
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    fields = response.json()["extracted_fields"]
+    assert fields["first_name"] is None
+    assert fields["last_name"] is None
+    assert fields["whatsapp_number"] is None
+    assert response.json()["review_warnings"] == []
+
+
+def test_voice_extract_rejects_ambiguous_local_whatsapp_without_country(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    headers = authenticated_headers(
+        database_session, permission_key=PermissionKey.LEADS_VIEW
+    )
+    provider = FakeGroqProvider(
+        transcript="WhatsApp 01712345678",
+        extraction=voice_extraction(whatsapp_number="01712345678"),
+    )
+
+    response = post_voice(client, headers, provider)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["extracted_fields"]["whatsapp_number"] is None
+    assert any(
+        error["field"] == "whatsapp_number" and "recognized country" in error["message"]
+        for error in body["field_errors"]
+    )
 
 
 def test_voice_extract_denies_users_without_lead_menu_access(

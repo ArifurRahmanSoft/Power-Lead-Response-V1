@@ -15,7 +15,7 @@ MENU_CATALOG: tuple[MenuDefinition, ...] = (
         "Leads",
         ("view", "create", "update", "delete", "export", "import", "assign", "status"),
     ),
-    MenuDefinition("customers", "Customers", ("view", "convert")),
+    MenuDefinition("customers", "Customers", ("view", "create", "update", "convert")),
     MenuDefinition(
         "workflows",
         "Workflows",
