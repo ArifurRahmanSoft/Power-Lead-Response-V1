@@ -37,6 +37,25 @@ from app.schemas.meta_whatsapp import (
     MetaSendResponse,
     MetaTemplatePageData,
     MetaTemplatePageResponse,
+    MetaWhatsAppActivationRequest,
+    MetaWhatsAppCancelRequest,
+    MetaWhatsAppCompleteRequest,
+    MetaWhatsAppLaunchData,
+    MetaWhatsAppLaunchResponse,
+    MetaWhatsAppOperationData,
+    MetaWhatsAppOperationResponse,
+    MetaWhatsAppReadinessData,
+    MetaWhatsAppReadinessResponse,
+    MetaWhatsAppSettingReadiness,
+)
+from app.services.meta_whatsapp_oauth_service import (
+    MetaWhatsAppAssetConflictError,
+    MetaWhatsAppOAuthStateError,
+    activate_meta_whatsapp_oauth,
+    begin_meta_whatsapp_oauth,
+    cancel_meta_whatsapp_oauth,
+    complete_meta_whatsapp_oauth,
+    get_meta_whatsapp_oauth_operation,
 )
 from app.services.meta_whatsapp_service import (
     MetaWhatsAppChannelNotConfiguredError,
@@ -56,6 +75,7 @@ from app.services.meta_whatsapp_service import (
     open_conversation,
     page_count,
     process_webhook_payload,
+    provider_for_channel,
     recover_operation,
     send_message,
 )
@@ -63,6 +83,233 @@ from app.services.meta_whatsapp_service import (
 
 router = APIRouter()
 webhook_router = APIRouter()
+
+
+def _oauth_operation_data(operation) -> MetaWhatsAppOperationData:
+    return MetaWhatsAppOperationData(
+        operation_id=operation.id,
+        status=operation.status,
+        reason_code=operation.reason_code,
+        expires_at=operation.expires_at,
+        used_at=operation.used_at,
+        connection_mode=operation.connection_mode,
+        waba_id=operation.discovered_waba_id,
+        phone_number_id=operation.discovered_phone_number_id,
+        sender_address=operation.discovered_sender_address,
+        display_name=operation.discovered_display_name,
+        subscription_succeeded=operation.subscription_succeeded,
+        channel_id=operation.channel_id,
+        confirmation_required=operation.status == "confirmation_required",
+        credential_present=bool(operation.credential_ciphertext),
+    )
+
+
+def _oauth_error(exception: Exception) -> None:
+    if isinstance(exception, MetaWhatsAppOAuthStateError):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exception.code, "message": exception.message},
+        ) from exception
+    if isinstance(exception, MetaWhatsAppAssetConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exception.code, "message": exception.message},
+        ) from exception
+    if isinstance(exception, MetaWhatsAppError):
+        raise HTTPException(
+            status_code=503 if exception.http_status is None else 400,
+            detail={"code": exception.code, "message": exception.safe_message},
+        ) from exception
+    raise exception
+
+
+@webhook_router.get("/api/integrations/meta/whatsapp/oauth/callback")
+def meta_whatsapp_oauth_callback_landing() -> dict[str, object]:
+    """Safe registration landing; the documented JS SDK returns code to JS."""
+    return {
+        "success": True,
+        "message": (
+            "Meta WhatsApp callback URI is ready; complete Embedded Signup "
+            "through the authenticated code handoff endpoint"
+        ),
+        "data": {
+            "callback_ready": True,
+            "code_handoff_endpoint": (
+                "/api/messages/meta/whatsapp/connect/complete"
+            ),
+        },
+    }
+
+
+@router.get(
+    "/connect/readiness",
+    response_model=MetaWhatsAppReadinessResponse,
+)
+def meta_whatsapp_connect_readiness(
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_VIEW)),
+    ],
+    provider: Annotated[MetaWhatsAppProvider, Depends(get_meta_whatsapp_provider)],
+) -> MetaWhatsAppReadinessResponse:
+    del context
+    diagnostic = provider.oauth_configuration_diagnostic()
+    return MetaWhatsAppReadinessResponse(
+        data=MetaWhatsAppReadinessData(
+            settings=[
+                MetaWhatsAppSettingReadiness(
+                    name=item.name,
+                    present=item.present,
+                    format_valid=item.format_valid,
+                )
+                for item in diagnostic.settings
+            ],
+            missing_settings=list(diagnostic.missing_settings),
+            invalid_settings=list(diagnostic.invalid_settings),
+            oauth_configuration_ready=diagnostic.ready,
+        )
+    )
+
+
+@router.post(
+    "/connect/initiate",
+    response_model=MetaWhatsAppLaunchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def initiate_meta_whatsapp_connection(
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    provider: Annotated[MetaWhatsAppProvider, Depends(get_meta_whatsapp_provider)],
+) -> MetaWhatsAppLaunchResponse:
+    try:
+        result = begin_meta_whatsapp_oauth(
+            database_session,
+            context,
+            provider,
+            expire_minutes=settings.meta_whatsapp_oauth_state_expire_minutes,
+        )
+    except MetaWhatsAppError as exception:
+        _oauth_error(exception)
+    return MetaWhatsAppLaunchResponse(
+        data=MetaWhatsAppLaunchData(
+            operation_id=result.operation.id,
+            state=result.state,
+            expires_at=result.operation.expires_at,
+            app_id=str(result.launch["app_id"]),
+            configuration_id=str(result.launch["configuration_id"]),
+            graph_api_version=str(result.launch["graph_api_version"]),
+            extras=dict(result.launch["extras"]),
+        )
+    )
+
+
+@router.post(
+    "/connect/complete",
+    response_model=MetaWhatsAppOperationResponse,
+)
+async def complete_meta_whatsapp_connection(
+    payload: MetaWhatsAppCompleteRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    provider: Annotated[MetaWhatsAppProvider, Depends(get_meta_whatsapp_provider)],
+) -> MetaWhatsAppOperationResponse:
+    try:
+        operation = await complete_meta_whatsapp_oauth(
+            database_session, context, provider, payload
+        )
+    except (MetaWhatsAppOAuthStateError, MetaWhatsAppAssetConflictError, MetaWhatsAppError) as exception:
+        database_session.rollback()
+        _oauth_error(exception)
+    return MetaWhatsAppOperationResponse(
+        message="Meta WhatsApp onboarding completion processed",
+        data=_oauth_operation_data(operation),
+    )
+
+
+@router.post(
+    "/connect/cancel",
+    response_model=MetaWhatsAppOperationResponse,
+)
+def cancel_meta_whatsapp_connection(
+    payload: MetaWhatsAppCancelRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> MetaWhatsAppOperationResponse:
+    try:
+        operation = cancel_meta_whatsapp_oauth(
+            database_session,
+            context,
+            operation_id=payload.operation_id,
+            state=payload.state,
+        )
+    except MetaWhatsAppOAuthStateError as exception:
+        database_session.rollback()
+        _oauth_error(exception)
+    return MetaWhatsAppOperationResponse(
+        message="Meta WhatsApp onboarding cancelled",
+        data=_oauth_operation_data(operation),
+    )
+
+
+@router.get(
+    "/connect/operations/{operation_id}",
+    response_model=MetaWhatsAppOperationResponse,
+)
+def meta_whatsapp_connection_status(
+    operation_id: uuid.UUID,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_VIEW)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+) -> MetaWhatsAppOperationResponse:
+    try:
+        operation = get_meta_whatsapp_oauth_operation(
+            database_session, context, operation_id
+        )
+    except MetaWhatsAppOAuthStateError as exception:
+        _oauth_error(exception)
+    return MetaWhatsAppOperationResponse(data=_oauth_operation_data(operation))
+
+
+@router.post(
+    "/connect/operations/{operation_id}/activate",
+    response_model=MetaWhatsAppOperationResponse,
+)
+async def activate_meta_whatsapp_connection(
+    operation_id: uuid.UUID,
+    payload: MetaWhatsAppActivationRequest,
+    context: Annotated[
+        WorkspaceContext,
+        Depends(require_permission(PermissionKey.SETTINGS_INTEGRATIONS_UPDATE)),
+    ],
+    database_session: Annotated[Session, Depends(get_db)],
+    provider: Annotated[MetaWhatsAppProvider, Depends(get_meta_whatsapp_provider)],
+) -> MetaWhatsAppOperationResponse:
+    try:
+        operation = await activate_meta_whatsapp_oauth(
+            database_session,
+            context,
+            provider,
+            operation_id=operation_id,
+            confirm_replace_existing_sender=payload.confirm_replace_existing_sender,
+        )
+    except (MetaWhatsAppOAuthStateError, MetaWhatsAppAssetConflictError, MetaWhatsAppError) as exception:
+        database_session.rollback()
+        _oauth_error(exception)
+    return MetaWhatsAppOperationResponse(
+        message="Meta WhatsApp onboarding activation processed",
+        data=_oauth_operation_data(operation),
+    )
 
 
 def _message_data(message: WhatsAppMessage) -> MetaMessageData:
@@ -139,6 +386,9 @@ def get_meta_channel(
             phone_number_id=channel.provider_channel_id or "",
             sender_address=channel.sender_address,
             active=channel.is_active,
+            connection_mode=channel.connection_mode,
+            credentials_configured=bool(channel.credential_ciphertext),
+            subscription_status=channel.subscription_status,
         )
     )
 
@@ -387,9 +637,12 @@ async def list_meta_templates(
     search: Annotated[str | None, Query(max_length=200)] = None,
 ) -> MetaTemplatePageResponse:
     try:
-        channel_for_context(database_session, context, provider)
+        channel = channel_for_context(database_session, context, provider)
+        selected_provider = provider_for_channel(provider, channel)
         templates = normalize_templates(
-            await provider.list_templates(limit=settings.meta_whatsapp_template_fetch_limit)
+            await selected_provider.list_templates(
+                limit=settings.meta_whatsapp_template_fetch_limit
+            )
         )
     except MetaWhatsAppChannelNotConfiguredError as exception:
         _channel_unavailable(exception)

@@ -9,6 +9,7 @@ from app.models.mail_template import (
 )
 from app.models.message_template import MessageTemplate
 from app.models.meta_instagram_oauth import MetaInstagramOAuthState
+from app.models.meta_whatsapp_oauth import MetaWhatsAppOAuthOperation
 from app.models.lead import Lead, LeadCustomerAction, LeadEvent, LeadImportBatch, LeadImportRow
 from app.models.lead_activity import LeadActivity
 from app.models.lead_assignment import LeadAssignmentHistory
@@ -47,6 +48,7 @@ __all__ = [
     "MailTemplateVersionAsset",
     "MessageTemplate",
     "MetaInstagramOAuthState",
+    "MetaWhatsAppOAuthOperation",
     "Lead",
     "LeadCustomerAction",
     "LeadEvent",

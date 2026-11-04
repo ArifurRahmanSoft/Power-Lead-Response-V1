@@ -12,6 +12,9 @@ class MetaChannelData(BaseModel):
     phone_number_id: str
     sender_address: str
     active: bool
+    connection_mode: Literal["coexistence"] | None = None
+    credentials_configured: bool = False
+    subscription_status: str | None = None
 
 
 class MetaChannelResponse(BaseModel):
@@ -223,3 +226,105 @@ class MetaConversationLinkRequest(BaseModel):
         if (self.lead_id is None) == (self.customer_id is None):
             raise ValueError("Provide exactly one of lead_id or customer_id")
         return self
+
+
+class MetaWhatsAppSettingReadiness(BaseModel):
+    name: str
+    present: bool
+    format_valid: bool
+
+
+class MetaWhatsAppReadinessData(BaseModel):
+    settings: list[MetaWhatsAppSettingReadiness]
+    missing_settings: list[str]
+    invalid_settings: list[str]
+    oauth_configuration_ready: bool
+    onboarding_mode: Literal["facebook_js_sdk"] = "facebook_js_sdk"
+    coexistence_requested: bool = True
+    hosted_signup_supports_coexistence_customization: bool = False
+    callback_contract: Literal["authenticated_code_handoff"] = (
+        "authenticated_code_handoff"
+    )
+
+
+class MetaWhatsAppReadinessResponse(BaseModel):
+    success: bool = True
+    message: str = "Meta WhatsApp onboarding readiness retrieved"
+    data: MetaWhatsAppReadinessData
+
+
+class MetaWhatsAppLaunchData(BaseModel):
+    operation_id: uuid.UUID
+    state: str
+    expires_at: datetime
+    launch_mode: Literal["facebook_js_sdk"] = "facebook_js_sdk"
+    app_id: str
+    configuration_id: str
+    graph_api_version: str
+    response_type: Literal["code"] = "code"
+    override_default_response_type: bool = True
+    extras: dict[str, object]
+    completion_endpoint: str = "/api/messages/meta/whatsapp/connect/complete"
+
+
+class MetaWhatsAppLaunchResponse(BaseModel):
+    success: bool = True
+    message: str = "Meta WhatsApp onboarding operation created"
+    data: MetaWhatsAppLaunchData
+
+
+class MetaWhatsAppEmbeddedSession(BaseModel):
+    event: Literal["FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING"]
+    waba_id: str = Field(pattern=r"^[0-9]{1,32}$")
+    phone_number_id: str = Field(pattern=r"^[0-9]{1,32}$")
+    business_id: str | None = Field(default=None, pattern=r"^[0-9]{1,32}$")
+
+
+class MetaWhatsAppCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: uuid.UUID
+    state: str = Field(min_length=20, max_length=512)
+    code: str = Field(min_length=1, max_length=4096)
+    session: MetaWhatsAppEmbeddedSession
+
+
+class MetaWhatsAppOperationData(BaseModel):
+    operation_id: uuid.UUID
+    status: Literal[
+        "pending",
+        "processing",
+        "confirmation_required",
+        "subscription_failed",
+        "completed",
+        "failed",
+        "cancelled",
+        "expired",
+    ]
+    reason_code: str | None
+    expires_at: datetime
+    used_at: datetime | None
+    connection_mode: Literal["coexistence"] | None
+    waba_id: str | None
+    phone_number_id: str | None
+    sender_address: str | None
+    display_name: str | None
+    subscription_succeeded: bool | None
+    channel_id: uuid.UUID | None
+    confirmation_required: bool
+    credential_present: bool
+
+
+class MetaWhatsAppOperationResponse(BaseModel):
+    success: bool = True
+    message: str = "Meta WhatsApp onboarding operation retrieved"
+    data: MetaWhatsAppOperationData
+
+
+class MetaWhatsAppActivationRequest(BaseModel):
+    confirm_replace_existing_sender: bool = False
+
+
+class MetaWhatsAppCancelRequest(BaseModel):
+    operation_id: uuid.UUID
+    state: str = Field(min_length=20, max_length=512)

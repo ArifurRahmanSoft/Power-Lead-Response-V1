@@ -1261,6 +1261,11 @@ Store real values only in `.env` or the deployment secret manager:
 META_WHATSAPP_ACCESS_TOKEN=
 META_WHATSAPP_PHONE_NUMBER_ID=
 META_WHATSAPP_WABA_ID=
+META_WHATSAPP_APP_ID=
+META_WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID=
+META_WHATSAPP_EMBEDDED_SIGNUP_VERSION=v5
+META_WHATSAPP_OAUTH_REDIRECT_URI=
+META_WHATSAPP_OAUTH_STATE_EXPIRE_MINUTES=10
 META_APP_SECRET=
 META_WEBHOOK_VERIFY_TOKEN=
 META_GRAPH_API_VERSION=v26.0
@@ -1273,6 +1278,56 @@ META_WHATSAPP_TEMPLATE_FETCH_LIMIT=500
 `META_APP_SECRET`, the access token and verify token are server-only and are never
 returned by an API. `META_GRAPH_API_VERSION` is configurable so a supported Graph
 version can be advanced without changing code.
+
+### Embedded Signup and Business app Coexistence
+
+The backend uses Meta's documented Facebook JavaScript SDK Embedded Signup
+contract for Coexistence. Meta's Hosted Embedded Signup page is non-customizable;
+the documented Business-app onboarding flow requires session logging and the
+`whatsapp_business_app_onboarding` feature (on v4; v5 enables it by default).
+The JS SDK returns the short-lived code to its browser callback and emits the
+selected WABA/phone IDs in a `WA_EMBEDDED_SIGNUP` event. It does not redirect the
+code and asset IDs to a backend GET callback.
+
+The public callback registration landing is:
+
+```text
+https://<backend-host>/api/integrations/meta/whatsapp/oauth/callback
+```
+
+It never exchanges codes. The authorized frontend must call `connect/initiate`,
+launch `FB.login` with the returned options, verify the Facebook event origin,
+then immediately hand the code plus the exact
+`FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING` session payload to the authenticated
+`connect/complete` endpoint. Codes and state must never be placed in URLs.
+
+```text
+GET  /api/messages/meta/whatsapp/connect/readiness
+POST /api/messages/meta/whatsapp/connect/initiate
+POST /api/messages/meta/whatsapp/connect/complete
+POST /api/messages/meta/whatsapp/connect/cancel
+GET  /api/messages/meta/whatsapp/connect/operations/{operation_id}
+POST /api/messages/meta/whatsapp/connect/operations/{operation_id}/activate
+GET  /api/integrations/meta/whatsapp/oauth/callback
+```
+
+Initiation/completion/activation require `settings.integrations.update`;
+readiness/status require `settings.integrations.view`. Completion validates the
+short-lived token against the configured app, verifies required permissions and
+actual WABA/phone access, requires provider evidence that the number remains on
+the Business app, encrypts the business token, and subscribes the WABA. It does
+not call the ordinary phone-number registration API. A different active sender
+requires explicit activation confirmation. A failed subscription remains a safe,
+recoverable operation and is never reported as connected.
+
+Required Meta-side eligibility remains outside application control: Solution
+Partner or Tech Provider status, business verification, App Review/Advanced
+Access for `whatsapp_business_management` and `whatsapp_business_messaging`, an
+eligible Business-app account/number, a production webhook, and a Facebook Login
+for Business configuration. See Meta's current
+[Embedded Signup implementation](https://developers.facebook.com/documentation/business-messaging/whatsapp/embedded-signup/implementation/)
+and [Business app onboarding](https://developers.facebook.com/documentation/business-messaging/whatsapp/embedded-signup/onboarding-business-app-users/)
+documentation.
 
 Apply the reviewed migration explicitly; application startup never runs it:
 
@@ -1295,14 +1350,16 @@ command is transactional and idempotent, and does not alter the Twilio mapping:
 3. Enter the same server-side value configured as `META_WEBHOOK_VERIFY_TOKEN`.
    Meta's `GET` verification receives the exact challenge as plain text.
 4. Subscribe the WhatsApp Business Account to the app and subscribe the
-   `messages` webhook field. WABA app subscription can be checked/created using
+   `messages` webhook field. For Coexistence also subscribe `account_update`,
+   `history`, `smb_app_state_sync`, and `smb_message_echoes`. WABA app subscription can be checked/created using
    Graph API `GET/POST /<WABA_ID>/subscribed_apps` with an appropriately
    authorized token.
 5. Confirm inbound and status callbacks contain the configured WABA ID and Phone
    Number ID. The backend rejects any other mapping.
 
 Every `POST` webhook is validated from the raw request bytes with
-`X-Hub-Signature-256` and `META_APP_SECRET`. Messages/status events are deduplicated
+`X-Hub-Signature-256` and `META_APP_SECRET`. Messages/status events and supported
+Business-app outbound echoes are deduplicated
 in PostgreSQL. Unsupported media creates a safe placeholder; the backend neither
 downloads remote media nor automatically replies or creates a lead.
 The verification token is redacted from the server access-log query string.

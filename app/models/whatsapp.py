@@ -62,6 +62,11 @@ class WhatsAppChannel(Base):
     sender_address: Mapped[str] = mapped_column(String(32), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    connection_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subscription_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    subscription_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     profile_refreshed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

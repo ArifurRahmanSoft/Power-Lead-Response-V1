@@ -94,6 +94,11 @@ class Settings(BaseSettings):
     meta_whatsapp_access_token: SecretStr | None = None
     meta_whatsapp_phone_number_id: str | None = None
     meta_whatsapp_waba_id: str | None = None
+    meta_whatsapp_app_id: str | None = None
+    meta_whatsapp_embedded_signup_config_id: str | None = None
+    meta_whatsapp_embedded_signup_version: Literal["v4", "v5"] = "v5"
+    meta_whatsapp_oauth_redirect_uri: str | None = None
+    meta_whatsapp_oauth_state_expire_minutes: int = Field(default=10, ge=5, le=30)
     meta_app_secret: SecretStr | None = None
     meta_webhook_verify_token: SecretStr | None = None
     meta_messenger_verify_token: SecretStr | None = None

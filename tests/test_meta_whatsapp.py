@@ -163,6 +163,39 @@ def _status_payload(*, message_id: str, state: str = "delivered", timestamp: str
     }
 
 
+def _echo_payload(*, message_id: str = "wamid.echo.001", recipient: str = "14155550123"):
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": MockMetaProvider.waba_id,
+                "changes": [
+                    {
+                        "field": "smb_message_echoes",
+                        "value": {
+                            "metadata": {
+                                "phone_number_id": MockMetaProvider.phone_number_id
+                            },
+                            "messages": [
+                                {
+                                    "from": "14155550000",
+                                    "to": recipient,
+                                    "id": message_id,
+                                    "timestamp": str(
+                                        int(datetime.now(timezone.utc).timestamp())
+                                    ),
+                                    "type": "text",
+                                    "text": {"body": "Sent from Business app"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def _post_webhook(client: TestClient, payload: dict, signature: str = "sha256=valid"):
     return client.post(
         "/api/webhooks/meta/whatsapp",
@@ -216,6 +249,31 @@ def test_challenge_inbound_dedup_and_provider_isolation(
     assert meta_list.json()["data"]["total"] == 1
     assert meta_list.json()["data"]["items"][0]["external_address"] == "+14155550123"
     assert twilio_list.json()["data"]["total"] == 0
+
+
+def test_business_app_echo_is_outbound_and_deduplicated(
+    client: TestClient, database_session: Session
+) -> None:
+    tenant, _, _, _, _, _, _ = setup(client, database_session)
+    _channel(database_session, tenant.id)
+    provider = MockMetaProvider()
+    app.dependency_overrides[get_meta_whatsapp_provider] = lambda: provider
+    try:
+        first = _post_webhook(client, _echo_payload())
+        duplicate = _post_webhook(client, _echo_payload())
+    finally:
+        app.dependency_overrides.pop(get_meta_whatsapp_provider, None)
+
+    assert first.status_code == duplicate.status_code == 200
+    messages = database_session.scalars(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.provider_message_sid == "wamid.echo.001"
+        )
+    ).all()
+    assert len(messages) == 1
+    assert messages[0].direction == "outbound"
+    assert messages[0].requested_by_user_id is None
+    assert messages[0].status == "sent"
 
 
 def test_open_does_not_send_and_tenant_isolation(

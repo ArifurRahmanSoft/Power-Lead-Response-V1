@@ -26,7 +26,17 @@ class SensitiveQueryRedactionMiddleware:
             and scope.get("path")
             == "/api/integrations/meta/instagram/oauth/callback"
         )
-        if is_webhook_verification or is_instagram_oauth_callback:
+        is_whatsapp_oauth_callback = (
+            scope.get("type") == "http"
+            and scope.get("method") == "GET"
+            and scope.get("path")
+            == "/api/integrations/meta/whatsapp/oauth/callback"
+        )
+        if (
+            is_webhook_verification
+            or is_instagram_oauth_callback
+            or is_whatsapp_oauth_callback
+        ):
             query = parse_qsl(
                 scope.get("query_string", b"").decode("utf-8", errors="replace"),
                 keep_blank_values=True,
@@ -38,7 +48,9 @@ class SensitiveQueryRedactionMiddleware:
                 if key == "hub.verify_token":
                     original_token = value
                     redacted.append((key, "[REDACTED]"))
-                elif is_instagram_oauth_callback and key in {"code", "state"}:
+                elif (
+                    is_instagram_oauth_callback or is_whatsapp_oauth_callback
+                ) and key in {"code", "state"}:
                     oauth_values[key] = value
                     redacted.append((key, "[REDACTED]"))
                 else:
@@ -49,7 +61,11 @@ class SensitiveQueryRedactionMiddleware:
                 ] = original_token
             if oauth_values:
                 scope.setdefault("state", {})[
-                    "meta_instagram_oauth_query"
+                    (
+                        "meta_instagram_oauth_query"
+                        if is_instagram_oauth_callback
+                        else "meta_whatsapp_oauth_query"
+                    )
                 ] = oauth_values
             if original_token is not None or oauth_values:
                 scope["query_string"] = urlencode(redacted, doseq=True).encode("utf-8")

@@ -61,6 +61,11 @@ from app.services.whatsapp_service import (
     service_window,
 )
 from app.utils.phone import normalize_e164_phone
+from app.utils.credential_encryption import (
+    CredentialDecryptionError,
+    CredentialEncryptionNotConfiguredError,
+    decrypt_credential,
+)
 
 
 META_PROVIDER = "meta"
@@ -138,18 +143,44 @@ def channel_for_context(
     context: WorkspaceContext,
     provider: MetaWhatsAppProvider,
 ) -> WhatsAppChannel:
-    if not provider.configured:
-        raise MetaWhatsAppChannelNotConfiguredError
     channel = get_channel_for_tenant(
         database_session, tenant_id=context.tenant.id, provider=META_PROVIDER
     )
-    if (
-        channel is None
+    if channel is None:
+        raise MetaWhatsAppChannelNotConfiguredError
+    if not channel.credential_ciphertext and (
+        not provider.configured
         or channel.provider_account_id != provider.waba_id
         or channel.provider_channel_id != provider.phone_number_id
     ):
         raise MetaWhatsAppChannelNotConfiguredError
     return channel
+
+
+def provider_for_channel(
+    provider: MetaWhatsAppProvider,
+    channel: WhatsAppChannel,
+) -> MetaWhatsAppProvider:
+    if channel.credential_ciphertext:
+        try:
+            token = decrypt_credential(channel.credential_ciphertext)
+        except (
+            CredentialDecryptionError,
+            CredentialEncryptionNotConfiguredError,
+        ) as exception:
+            raise MetaWhatsAppConfigurationError(
+                safe_message="The connected Meta WhatsApp credential is unavailable"
+            ) from exception
+        selected = provider.with_channel_credentials(
+            access_token=token,
+            waba_id=channel.provider_account_id or "",
+            phone_number_id=channel.provider_channel_id or "",
+        )
+    else:
+        selected = provider
+    if not selected.configured:
+        raise MetaWhatsAppConfigurationError()
+    return selected
 
 
 def get_meta_conversation_record(
@@ -507,6 +538,7 @@ async def send_message(
     provider: MetaWhatsAppProvider,
 ) -> MetaSendResult:
     channel = channel_for_context(database_session, context, provider)
+    send_provider = provider_for_channel(provider, channel)
     conversation = _resolve_send_conversation(
         database_session, context, provider, payload
     )
@@ -551,7 +583,7 @@ async def send_message(
                 "whatsapp_opt_in_required",
                 "Business-initiated WhatsApp templates require recorded opt-in",
             )
-        template = await _select_template(provider, payload)
+        template = await _select_template(send_provider, payload)
         template_components, template_snapshot, body = _template_components_and_snapshot(
             template, payload
         )
@@ -619,10 +651,10 @@ async def send_message(
         message.provider_request_started_at = _now()
         database_session.commit()
         if payload.mode == "text":
-            provider_result = await provider.send_text(to=recipient, body=body)
+            provider_result = await send_provider.send_text(to=recipient, body=body)
         else:
             assert payload.template is not None
-            provider_result = await provider.send_template(
+            provider_result = await send_provider.send_template(
                 to=recipient,
                 name=payload.template.name,
                 language=payload.template.language,
@@ -846,17 +878,21 @@ def process_webhook_payload(
     *,
     _retry_on_conflict: bool = True,
 ) -> dict[str, int]:
-    if not provider.configured:
-        raise MetaWhatsAppWebhookRejectedError
     entries = payload.get("entry")
     if payload.get("object") != "whatsapp_business_account" or not isinstance(entries, list):
         raise MetaWhatsAppWebhookRejectedError
-    counts = {"messages": 0, "statuses": 0, "duplicates": 0}
+    counts = {"messages": 0, "statuses": 0, "echoes": 0, "duplicates": 0}
     for entry in entries:
-        if not isinstance(entry, dict) or str(entry.get("id") or "") != provider.waba_id:
+        if not isinstance(entry, dict):
+            raise MetaWhatsAppWebhookRejectedError
+        entry_waba_id = str(entry.get("id") or "")
+        if not entry_waba_id:
             raise MetaWhatsAppWebhookRejectedError
         for change in entry.get("changes", []):
-            if not isinstance(change, dict) or change.get("field") != "messages":
+            if not isinstance(change, dict) or change.get("field") not in {
+                "messages",
+                "smb_message_echoes",
+            }:
                 continue
             value = change.get("value")
             if not isinstance(value, dict):
@@ -867,11 +903,11 @@ def process_webhook_payload(
                 if isinstance(metadata, dict)
                 else ""
             )
-            if phone_number_id != provider.phone_number_id:
+            if not phone_number_id:
                 raise MetaWhatsAppWebhookRejectedError
             channel = get_active_meta_channel_by_identity(
                 database_session,
-                waba_id=provider.waba_id,
+                waba_id=entry_waba_id,
                 phone_number_id=phone_number_id,
             )
             if channel is None:
@@ -881,7 +917,10 @@ def process_webhook_payload(
                     continue
                 provider_message_id = str(raw_message.get("id") or "").strip()
                 try:
-                    sender = _meta_address(raw_message.get("from"))
+                    is_echo = change.get("field") == "smb_message_echoes"
+                    contact = _meta_address(
+                        raw_message.get("to") if is_echo else raw_message.get("from")
+                    )
                 except ValueError as exception:
                     raise MetaWhatsAppWebhookRejectedError from exception
                 if not provider_message_id:
@@ -900,16 +939,16 @@ def process_webhook_payload(
                 conversation = get_conversation_by_contact(
                     database_session,
                     channel_id=channel.id,
-                    external_address=sender,
+                    external_address=contact,
                     for_update=True,
                 )
                 if conversation is None:
                     conversation = WhatsAppConversation(
                         tenant_id=channel.tenant_id,
                         channel_id=channel.id,
-                        external_address=sender,
+                        external_address=contact,
                         last_message_at=occurred_at,
-                        last_inbound_at=occurred_at,
+                        last_inbound_at=None if is_echo else occurred_at,
                     )
                     database_session.add(conversation)
                     database_session.flush()
@@ -917,16 +956,16 @@ def process_webhook_payload(
                 message = WhatsAppMessage(
                     tenant_id=channel.tenant_id,
                     conversation_id=conversation.id,
-                    direction="inbound",
+                    direction="outbound" if is_echo else "inbound",
                     provider=META_PROVIDER,
                     message_mode="text",
                     body=body,
                     media_metadata=_meta_media(raw_message),
-                    sender_address=sender,
-                    recipient_address=channel.sender_address,
+                    sender_address=channel.sender_address if is_echo else contact,
+                    recipient_address=contact if is_echo else channel.sender_address,
                     provider_message_sid=provider_message_id,
-                    status="received",
-                    submission_state="received",
+                    status="sent" if is_echo else "received",
+                    submission_state="completed" if is_echo else "received",
                     occurred_at=occurred_at,
                     completed_at=occurred_at,
                 )
@@ -935,11 +974,14 @@ def process_webhook_payload(
                 conversation.last_message_at = max(
                     conversation.last_message_at, occurred_at
                 )
-                if conversation.last_inbound_at is None or occurred_at > conversation.last_inbound_at:
+                if not is_echo and (
+                    conversation.last_inbound_at is None
+                    or occurred_at > conversation.last_inbound_at
+                ):
                     conversation.last_inbound_at = occurred_at
                 conversation.last_message_preview = body[:240]
                 _add_activity(database_session, conversation=conversation, message=message)
-                counts["messages"] += 1
+                counts["echoes" if is_echo else "messages"] += 1
             for raw_status in value.get("statuses", []):
                 if not isinstance(raw_status, dict):
                     continue
