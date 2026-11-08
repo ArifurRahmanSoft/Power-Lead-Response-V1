@@ -148,7 +148,10 @@ def list_authorized_lead_ids(
     )
     total = database_session.scalar(select(func.count(Lead.id)).where(*conditions)) or 0
     ids = list(database_session.scalars(
-        select(Lead.id).where(*conditions).order_by(Lead.created_at.desc(), Lead.id).limit(limit)
+        select(Lead.id)
+        .where(*conditions)
+        .order_by(Lead.created_at.desc(), Lead.id.desc())
+        .limit(limit)
     ).all())
     return ids, total
 
@@ -256,7 +259,7 @@ def list_leads(
         database_session.scalars(
             select(Lead)
             .where(*conditions)
-            .order_by(Lead.created_at.desc(), Lead.id)
+            .order_by(Lead.created_at.desc(), Lead.id.desc())
             .offset((page - 1) * size)
             .limit(size)
         ).all()

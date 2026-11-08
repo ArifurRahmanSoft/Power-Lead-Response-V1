@@ -337,6 +337,26 @@ def calculate_eligibility(
     )
 
 
+def _raise_if_reply_ineligible(
+    database_session: Session,
+    conversation: WhatsAppConversation,
+) -> None:
+    eligibility = calculate_eligibility(database_session, conversation)
+    if eligibility.reply_allowed:
+        return
+    reason = eligibility.blocking_reasons[0]
+    raise MetaInstagramEligibilityError(
+        reason.code,
+        reason.message,
+        window_expires_at=(
+            eligibility.window_expires_at.isoformat()
+            if eligibility.window_expires_at
+            else None
+        ),
+        blocking_reasons=[item.model_dump() for item in eligibility.blocking_reasons],
+    )
+
+
 def _stored_idempotency_key(user_id: uuid.UUID, key: str) -> str:
     digest = hashlib.sha256(key.encode()).hexdigest()
     return f"ig:{user_id}:{digest}"
@@ -394,15 +414,7 @@ async def send_reply(
         get_instagram_conversation_record(database_session, context, existing.conversation_id)
         return MetaInstagramSendResult(existing, True)
 
-    eligibility = calculate_eligibility(database_session, conversation)
-    if not eligibility.reply_allowed:
-        reason = eligibility.blocking_reasons[0]
-        raise MetaInstagramEligibilityError(
-            reason.code,
-            reason.message,
-            window_expires_at=(eligibility.window_expires_at.isoformat() if eligibility.window_expires_at else None),
-            blocking_reasons=[item.model_dump() for item in eligibility.blocking_reasons],
-        )
+    _raise_if_reply_ineligible(database_session, conversation)
     if len(payload.text.encode("utf-8")) > 1000:
         raise MetaInstagramEligibilityError(
             "message_too_long",
@@ -459,8 +471,12 @@ async def send_reply(
             window_seconds=settings.meta_instagram_reply_rate_limit_window_seconds,
         )
         stored = database_session.get(WhatsAppMessage, message.id)
-        if stored is None:
+        stored_conversation = database_session.get(WhatsAppConversation, conversation.id)
+        if stored is None or stored_conversation is None:
             raise MetaInstagramNotFoundError
+        # Recheck immediately before the provider attempt. The standard reply
+        # window may close between request validation and durable intent setup.
+        _raise_if_reply_ineligible(database_session, stored_conversation)
         stored.provider_request_started_at = _now()
         database_session.commit()
         provider_result = await send_provider.send_text(to=recipient, body=payload.text)
@@ -493,11 +509,22 @@ async def send_reply(
                     )
                 stored.provider_message_sid = provider_result.message_id
                 stored.status = _advance_status(stored.status, provider_result.status)
-            elif isinstance(provider_error, (MetaInstagramRejectedError, MetaInstagramConfigurationError)):
+            elif isinstance(
+                provider_error,
+                (
+                    MetaInstagramRejectedError,
+                    MetaInstagramConfigurationError,
+                    MetaInstagramEligibilityError,
+                ),
+            ):
                 stored.status = "failed"
                 stored.provider_error_code = provider_error.code
-                stored.provider_http_status = provider_error.http_status
-                stored.failure_reason = provider_error.safe_message
+                stored.provider_http_status = getattr(provider_error, "http_status", None)
+                stored.failure_reason = getattr(
+                    provider_error,
+                    "safe_message",
+                    getattr(provider_error, "message", "Instagram reply is not eligible"),
+                )
             else:
                 stored.status = "unknown"
                 stored.provider_error_code = "acceptance_unknown"
@@ -629,9 +656,18 @@ def link_conversation(
 
 def _timestamp_ms(value: object) -> datetime:
     try:
-        return datetime.fromtimestamp(int(str(value)) / 1000, tz=timezone.utc)
-    except (TypeError, ValueError, OSError):
-        return _now()
+        raw_value = str(value).strip()
+        if not raw_value.isdecimal():
+            raise ValueError("timestamp must be an integer")
+        milliseconds = int(raw_value)
+        # Meta messaging webhook event timestamps are Unix milliseconds. Reject
+        # second-based or malformed values instead of treating receipt time as
+        # customer interaction, which could incorrectly open a reply window.
+        if milliseconds < 1_000_000_000_000:
+            raise ValueError("timestamp must use Unix milliseconds")
+        return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError) as exception:
+        raise MetaInstagramPayloadError from exception
 
 
 def _provider_id(value: object) -> str:

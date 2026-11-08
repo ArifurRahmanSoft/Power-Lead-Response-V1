@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import app.commands.map_meta_instagram_account as mapping_command
 import app.providers.meta_instagram as meta_instagram_provider_module
 import app.routers.meta_instagram as instagram_router_module
+import app.services.meta_instagram_service as instagram_service_module
 from app.core.config import Settings
 from app.core.database import Base
 from app.core.permissions import RoleKey
@@ -51,6 +52,7 @@ from app.providers.meta_instagram import (
     safe_instagram_error,
 )
 from app.services.meta_instagram_service import (
+    calculate_eligibility,
     process_instagram_webhook_payload,
     provider_for_channel,
 )
@@ -221,11 +223,12 @@ def _message_event(
     message_id: str = "mid.ig.inbound.001",
     sender_id: str = "18000000000000001",
     text: str = "Hello from Instagram",
+    timestamp: int = 1792980000000,
 ) -> dict:
     return {
         "sender": {"id": sender_id},
         "recipient": {"id": MockInstagramProvider.account_id},
-        "timestamp": 1792980000000,
+        "timestamp": timestamp,
         "message": {"mid": message_id, "text": text},
     }
 
@@ -1365,6 +1368,196 @@ def test_webhook_dedup_account_isolation_echo_read_and_safe_media(
     assert media_record.media_metadata == [{"type": "image", "unsupported": True}]
     assert "private.example" not in json.dumps(media_record.media_metadata)
     assert database_session.query(WhatsAppDeliveryEvent).count() == 2
+
+
+def test_fresh_inbound_opens_window_out_of_order_does_not_regress_and_echo_does_not_extend(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    conversation = _conversation(
+        database_session,
+        tenant.id,
+        channel,
+        last_inbound_at=datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+    provider = MockInstagramProvider()
+    fresh_at = datetime.now(timezone.utc).replace(microsecond=123000)
+    older_at = fresh_at - timedelta(hours=2)
+
+    process_instagram_webhook_payload(
+        database_session,
+        provider,
+        _payload(
+            _message_event(
+                message_id="mid.ig.window.fresh",
+                sender_id=conversation.external_address,
+                timestamp=int(fresh_at.timestamp() * 1000),
+            ),
+            _message_event(
+                message_id="mid.ig.window.delayed",
+                sender_id=conversation.external_address,
+                timestamp=int(older_at.timestamp() * 1000),
+            ),
+        ),
+    )
+    database_session.refresh(conversation)
+    stored_inbound = conversation.last_inbound_at
+    assert stored_inbound is not None
+    if stored_inbound.tzinfo is None:
+        stored_inbound = stored_inbound.replace(tzinfo=timezone.utc)
+    assert stored_inbound == fresh_at
+    assert calculate_eligibility(database_session, conversation).reply_allowed is True
+
+    echo_at = fresh_at + timedelta(hours=1)
+    process_instagram_webhook_payload(
+        database_session,
+        provider,
+        _payload(
+            {
+                "sender": {"id": provider.account_id},
+                "recipient": {"id": conversation.external_address},
+                "timestamp": int(echo_at.timestamp() * 1000),
+                "message": {
+                    "mid": "mid.ig.window.echo",
+                    "text": "Native Instagram reply",
+                    "is_echo": True,
+                },
+            }
+        ),
+    )
+    database_session.refresh(conversation)
+    stored_after_echo = conversation.last_inbound_at
+    assert stored_after_echo is not None
+    if stored_after_echo.tzinfo is None:
+        stored_after_echo = stored_after_echo.replace(tzinfo=timezone.utc)
+    assert stored_after_echo == fresh_at
+
+    inbox = client.get(
+        "/api/messages/meta/instagram/conversations",
+        headers=headers,
+    )
+    assert inbox.status_code == 200
+    item = next(
+        item
+        for item in inbox.json()["data"]["items"]
+        if item["id"] == str(conversation.id)
+    )
+    assert item["eligibility"]["reply_allowed"] is True
+    assert item["eligibility"]["blocking_reasons"] == []
+
+
+def test_instagram_window_handles_timezone_and_expiry_without_provider_send(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    dhaka = timezone(timedelta(hours=6))
+    local_inbound = datetime.now(dhaka) - timedelta(hours=1)
+    open_conversation = WhatsAppConversation(
+        tenant_id=tenant.id,
+        channel_id=channel.id,
+        external_address="18000000000000071",
+        last_message_at=local_inbound,
+        last_inbound_at=local_inbound,
+    )
+    eligibility = calculate_eligibility(database_session, open_conversation)
+    assert eligibility.reply_allowed is True
+    assert eligibility.window_expires_at == local_inbound + timedelta(hours=24)
+
+    expired = _conversation(
+        database_session,
+        tenant.id,
+        channel,
+        igsid="18000000000000072",
+        last_inbound_at=datetime.now(timezone.utc) - timedelta(hours=25),
+    )
+    provider = MockInstagramProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        blocked = client.post(
+            f"/api/messages/meta/instagram/conversations/{expired.id}/reply",
+            headers=headers,
+            json={"text": "Blocked locally", "idempotency_key": "ig-window-expired-001"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "instagram_reply_window_closed"
+    assert blocked.json()["detail"]["window_expires_at"] is not None
+    assert provider.calls == []
+
+
+def test_instagram_window_is_rechecked_immediately_before_provider_send(
+    client: TestClient,
+    database_session: Session,
+    monkeypatch,
+) -> None:
+    tenant, _, _, _, _, _, headers = setup(client, database_session)
+    channel = _channel(database_session, tenant.id)
+    inbound_at = datetime.now(timezone.utc) - timedelta(hours=23, minutes=59)
+    conversation = _conversation(
+        database_session,
+        tenant.id,
+        channel,
+        igsid="18000000000000073",
+        last_inbound_at=inbound_at,
+    )
+    provider = MockInstagramProvider()
+    before_expiry = inbound_at + timedelta(hours=23, minutes=59, seconds=30)
+    after_expiry = inbound_at + timedelta(hours=24, seconds=1)
+    observed_times = iter((before_expiry, before_expiry, after_expiry))
+    monkeypatch.setattr(
+        instagram_service_module,
+        "_now",
+        lambda: next(observed_times, after_expiry),
+    )
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        response = client.post(
+            f"/api/messages/meta/instagram/conversations/{conversation.id}/reply",
+            headers=headers,
+            json={"text": "Boundary reply", "idempotency_key": "ig-window-boundary-001"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+    assert response.status_code == 200
+    assert response.json()["data"]["message"]["status"] == "failed"
+    assert (
+        response.json()["data"]["message"]["provider_error_code"]
+        == "instagram_reply_window_closed"
+    )
+    assert provider.calls == []
+
+
+def test_invalid_or_second_based_instagram_timestamp_does_not_open_window(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    tenant, _, _, _, _, _, _ = setup(client, database_session)
+    _channel(database_session, tenant.id)
+    provider = MockInstagramProvider()
+    app.dependency_overrides[get_meta_instagram_provider] = lambda: provider
+    try:
+        response = _post(
+            client,
+            _payload(
+                _message_event(
+                    message_id="mid.ig.invalid-seconds",
+                    timestamp=int(datetime.now(timezone.utc).timestamp()),
+                )
+            ),
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_instagram_provider, None)
+    assert response.status_code == 400
+    assert database_session.scalar(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.provider_message_sid == "mid.ig.invalid-seconds"
+        )
+    ) is None
 
 
 def test_persistence_failure_is_retryable(client: TestClient, monkeypatch) -> None:

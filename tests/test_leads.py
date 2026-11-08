@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
 import uuid
@@ -278,6 +279,75 @@ def test_assignee_validation_tenant_isolation_and_staff_scope(
         json=lead_payload("assigned@example.com"),
     )
     assert same_email_other_tenant.status_code == 201
+
+
+def test_lead_list_defaults_to_stable_newest_created_order_for_all_and_my_leads(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    roles, tenant, _, owner_headers = owner_setup(client, database_session)
+    staff = create_user(database_session, "sort.staff")
+    add_membership(database_session, staff, tenant, roles[RoleKey.STAFF])
+
+    created = [
+        client.post(
+            "/api/leads",
+            headers=owner_headers,
+            json=lead_payload(
+                f"sort-{index}@example.com",
+                company="Sort Company",
+                service_requested="Website Design",
+                assigned_user_id=str(staff.id),
+            ),
+        ).json()["data"]
+        for index in range(3)
+    ]
+
+    tied_created_at = datetime.now(timezone.utc) - timedelta(days=2)
+    newest_created_at = tied_created_at + timedelta(days=1)
+    lead_rows = [database_session.get(Lead, uuid.UUID(item["id"])) for item in created]
+    assert all(lead_rows)
+    lead_rows[0].created_at = tied_created_at
+    lead_rows[1].created_at = tied_created_at
+    lead_rows[2].created_at = newest_created_at
+    database_session.commit()
+
+    # Editing an older lead must not promote it above a more recently created lead.
+    updated = client.patch(
+        f"/api/leads/{created[0]['id']}",
+        headers=owner_headers,
+        json={"row_version": created[0]["row_version"], "notes": "Recently edited"},
+    )
+    assert updated.status_code == 200
+
+    tied_ids_desc = sorted(
+        (uuid.UUID(created[0]["id"]), uuid.UUID(created[1]["id"])),
+        reverse=True,
+    )
+    expected_ids = [created[2]["id"], *(str(item) for item in tied_ids_desc)]
+    list_url = (
+        "/api/leads?company=Sort%20Company&service_requested=Website%20Design"
+        "&page=1&size=2"
+    )
+
+    first_page = client.get(list_url, headers=owner_headers)
+    assert first_page.status_code == 200
+    assert first_page.json()["data"]["total"] == 3
+    assert [item["id"] for item in first_page.json()["data"]["items"]] == expected_ids[:2]
+
+    second_page = client.get(
+        list_url.replace("page=1", "page=2"),
+        headers=owner_headers,
+    )
+    assert second_page.status_code == 200
+    assert [item["id"] for item in second_page.json()["data"]["items"]] == expected_ids[2:]
+
+    # Staff "My Leads" uses the same stable repository ordering after scope filtering.
+    staff_headers = login_headers(client, staff)
+    my_leads = client.get(list_url, headers=staff_headers)
+    assert my_leads.status_code == 200
+    assert my_leads.json()["data"]["total"] == 3
+    assert [item["id"] for item in my_leads.json()["data"]["items"]] == expected_ids[:2]
 
 
 def test_excel_preview_commit_formulas_invalid_rows_and_retry(
