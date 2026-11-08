@@ -16,6 +16,7 @@ from app.models.meta_whatsapp_oauth import MetaWhatsAppOAuthOperation
 from app.models.tenant import Tenant
 from app.models.whatsapp import WhatsAppChannel
 from app.providers.meta_whatsapp import (
+    MetaWhatsAppConfigurationError,
     MetaWhatsAppDiscoveredAssets,
     MetaWhatsAppOAuthConfigurationDiagnostic,
     MetaWhatsAppOAuthError,
@@ -58,6 +59,9 @@ class MockEmbeddedSignupProvider:
                 "META_WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID", True, True
             ),
             MetaWhatsAppSettingDiagnostic(
+                "META_WHATSAPP_EMBEDDED_SIGNUP_VERSION", True, True
+            ),
+            MetaWhatsAppSettingDiagnostic(
                 "META_WHATSAPP_OAUTH_REDIRECT_URI", True, True
             ),
             MetaWhatsAppSettingDiagnostic("META_APP_SECRET", True, True),
@@ -84,6 +88,7 @@ class MockEmbeddedSignupProvider:
                 "setup": {},
                 "sessionInfoVersion": "3",
                 "featureType": "whatsapp_business_app_onboarding",
+                "version": "v4",
             },
         }
 
@@ -122,6 +127,7 @@ def _settings(**overrides):
         "smtp_credential_encryption_key": Fernet.generate_key().decode("ascii"),
         "meta_whatsapp_app_id": "111111111111111",
         "meta_whatsapp_embedded_signup_config_id": "222222222222222",
+        "meta_whatsapp_embedded_signup_version": "v4",
         "meta_whatsapp_oauth_redirect_uri": "https://api.example.test/meta/whatsapp/oauth",
         "meta_app_secret": "fixture-app-secret",
         "meta_graph_api_version": "v26.0",
@@ -185,6 +191,12 @@ def test_embedded_signup_authorization_completion_and_replay(
     assert readiness.json()["data"]["oauth_configuration_ready"] is True
     assert started.status_code == 201
     assert start["launch_mode"] == "facebook_js_sdk"
+    assert start["extras"] == {
+        "version": "v4",
+        "setup": {},
+        "sessionInfoVersion": "3",
+        "featureType": "whatsapp_business_app_onboarding",
+    }
     assert completed.status_code == 200
     assert completed.json()["data"]["status"] == "completed"
     assert completed.json()["data"]["connection_mode"] == "coexistence"
@@ -246,6 +258,9 @@ def test_oauth_configuration_diagnostics_cover_missing_and_invalid_settings() ->
         "META_WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID": {
             "meta_whatsapp_embedded_signup_config_id": None
         },
+        "META_WHATSAPP_EMBEDDED_SIGNUP_VERSION": {
+            "meta_whatsapp_embedded_signup_version": None
+        },
         "META_WHATSAPP_OAUTH_REDIRECT_URI": {
             "meta_whatsapp_oauth_redirect_uri": None
         },
@@ -267,6 +282,9 @@ def test_oauth_configuration_diagnostics_cover_missing_and_invalid_settings() ->
         "META_WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID": {
             "meta_whatsapp_embedded_signup_config_id": "not-an-id"
         },
+        "META_WHATSAPP_EMBEDDED_SIGNUP_VERSION": {
+            "meta_whatsapp_embedded_signup_version": "v6"
+        },
         "META_WHATSAPP_OAUTH_REDIRECT_URI": {
             "meta_whatsapp_oauth_redirect_uri": "http://api.example.test/callback"
         },
@@ -281,6 +299,77 @@ def test_oauth_configuration_diagnostics_cover_missing_and_invalid_settings() ->
         ).oauth_configuration_diagnostic()
         assert name in diagnostic.invalid_settings
         assert diagnostic.ready is False
+
+
+def test_embedded_signup_version_contracts_are_not_mixed() -> None:
+    v4 = MetaWhatsAppProvider(
+        _settings(meta_whatsapp_embedded_signup_version=" V4 ")
+    )
+    assert v4.embedded_signup_options()["extras"] == {
+        "version": "v4",
+        "setup": {},
+        "sessionInfoVersion": "3",
+        "featureType": "whatsapp_business_app_onboarding",
+    }
+
+    v5 = MetaWhatsAppProvider(
+        _settings(meta_whatsapp_embedded_signup_version="v5")
+    )
+    assert v5.embedded_signup_options()["extras"] == {"version": "v5"}
+
+    unsupported = MetaWhatsAppProvider(
+        _settings(meta_whatsapp_embedded_signup_version="v6")
+    )
+    assert unsupported.oauth_configuration_diagnostic().ready is False
+    try:
+        unsupported.embedded_signup_options()
+    except MetaWhatsAppConfigurationError as exception:
+        assert exception.code == "meta_whatsapp_embedded_signup_version_unsupported"
+    else:
+        raise AssertionError("Unsupported Embedded Signup version was accepted")
+
+    missing = MetaWhatsAppProvider(
+        _settings(meta_whatsapp_embedded_signup_version=None)
+    )
+    assert missing.oauth_configuration_diagnostic().ready is False
+    try:
+        missing.embedded_signup_options()
+    except MetaWhatsAppConfigurationError as exception:
+        assert exception.code == "meta_whatsapp_embedded_signup_version_missing"
+    else:
+        raise AssertionError("Missing Embedded Signup version was accepted")
+
+
+def test_initiation_rejects_unsupported_embedded_signup_version(
+    client: TestClient,
+    database_session: Session,
+) -> None:
+    _, _, _, _, _, _, headers = setup(client, database_session)
+    provider = MetaWhatsAppProvider(
+        _settings(meta_whatsapp_embedded_signup_version="v6")
+    )
+    app.dependency_overrides[get_meta_whatsapp_provider] = lambda: provider
+    try:
+        readiness = client.get(
+            "/api/messages/meta/whatsapp/connect/readiness", headers=headers
+        )
+        response = client.post(
+            "/api/messages/meta/whatsapp/connect/initiate", headers=headers
+        )
+    finally:
+        app.dependency_overrides.pop(get_meta_whatsapp_provider, None)
+
+    assert readiness.status_code == 200
+    assert readiness.json()["data"]["oauth_configuration_ready"] is False
+    assert (
+        "META_WHATSAPP_EMBEDDED_SIGNUP_VERSION"
+        in readiness.json()["data"]["invalid_settings"]
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == (
+        "meta_whatsapp_embedded_signup_version_unsupported"
+    )
+    assert database_session.scalar(select(MetaWhatsAppOAuthOperation)) is None
 
 
 def test_code_exchange_uses_documented_parameters_without_redirect_uri(

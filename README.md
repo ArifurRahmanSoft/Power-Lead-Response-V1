@@ -1263,7 +1263,7 @@ META_WHATSAPP_PHONE_NUMBER_ID=
 META_WHATSAPP_WABA_ID=
 META_WHATSAPP_APP_ID=
 META_WHATSAPP_EMBEDDED_SIGNUP_CONFIG_ID=
-META_WHATSAPP_EMBEDDED_SIGNUP_VERSION=v5
+META_WHATSAPP_EMBEDDED_SIGNUP_VERSION=v4
 META_WHATSAPP_OAUTH_REDIRECT_URI=
 META_WHATSAPP_OAUTH_STATE_EXPIRE_MINUTES=10
 META_APP_SECRET=
@@ -1284,7 +1284,9 @@ version can be advanced without changing code.
 The backend uses Meta's documented Facebook JavaScript SDK Embedded Signup
 contract for Coexistence. Meta's Hosted Embedded Signup page is non-customizable;
 the documented Business-app onboarding flow requires session logging and the
-`whatsapp_business_app_onboarding` feature (on v4; v5 enables it by default).
+`whatsapp_business_app_onboarding` feature on v4; v5 enables Business-app
+onboarding by default. The backend returns the configured version in
+`extras.version` and never mixes the v4-only feature/session fields into v5.
 The JS SDK returns the short-lived code to its browser callback and emits the
 selected WABA/phone IDs in a `WA_EMBEDDED_SIGNUP` event. It does not redirect the
 code and asset IDs to a backend GET callback.

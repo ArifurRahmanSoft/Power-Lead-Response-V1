@@ -13,6 +13,8 @@ from app.utils.phone import normalize_e164_phone
 
 GRAPH_VERSION_PATTERN = re.compile(r"^v[0-9]+\.[0-9]+$")
 META_OBJECT_ID_PATTERN = re.compile(r"^[0-9]{1,32}$")
+META_WHATSAPP_EMBEDDED_SIGNUP_VERSIONS = frozenset({"v4", "v5"})
+META_WHATSAPP_COEXISTENCE_FEATURE = "whatsapp_business_app_onboarding"
 
 
 class MetaWhatsAppError(Exception):
@@ -130,7 +132,9 @@ class MetaWhatsAppProvider:
         self.embedded_signup_config_id = (
             config.meta_whatsapp_embedded_signup_config_id or ""
         ).strip()
-        self.embedded_signup_version = config.meta_whatsapp_embedded_signup_version
+        self.embedded_signup_version = (
+            config.meta_whatsapp_embedded_signup_version or ""
+        ).strip().casefold()
         self.oauth_redirect_uri = (config.meta_whatsapp_oauth_redirect_uri or "").strip()
         self.app_secret = (
             config.meta_app_secret.get_secret_value() if config.meta_app_secret else ""
@@ -182,6 +186,12 @@ class MetaWhatsAppProvider:
                 bool(META_OBJECT_ID_PATTERN.fullmatch(self.embedded_signup_config_id)),
             ),
             MetaWhatsAppSettingDiagnostic(
+                "META_WHATSAPP_EMBEDDED_SIGNUP_VERSION",
+                bool(self.embedded_signup_version),
+                self.embedded_signup_version
+                in META_WHATSAPP_EMBEDDED_SIGNUP_VERSIONS,
+            ),
+            MetaWhatsAppSettingDiagnostic(
                 "META_WHATSAPP_OAUTH_REDIRECT_URI",
                 bool(self.oauth_redirect_uri),
                 redirect_valid,
@@ -212,16 +222,32 @@ class MetaWhatsAppProvider:
         )
 
     def embedded_signup_options(self) -> dict[str, object]:
+        if not self.embedded_signup_version:
+            raise MetaWhatsAppConfigurationError(
+                code="meta_whatsapp_embedded_signup_version_missing",
+                safe_message="Meta WhatsApp Embedded Signup version is not configured",
+            )
+        if (
+            self.embedded_signup_version
+            not in META_WHATSAPP_EMBEDDED_SIGNUP_VERSIONS
+        ):
+            raise MetaWhatsAppConfigurationError(
+                code="meta_whatsapp_embedded_signup_version_unsupported",
+                safe_message="Meta WhatsApp Embedded Signup version is unsupported",
+            )
         if not self.oauth_configured:
             raise MetaWhatsAppConfigurationError(
                 safe_message="Meta WhatsApp Embedded Signup is not configured"
             )
-        extras: dict[str, object] = {
-            "setup": {},
-            "sessionInfoVersion": "3",
-        }
+        extras: dict[str, object] = {"version": self.embedded_signup_version}
         if self.embedded_signup_version == "v4":
-            extras["featureType"] = "whatsapp_business_app_onboarding"
+            extras.update(
+                {
+                    "setup": {},
+                    "sessionInfoVersion": "3",
+                    "featureType": META_WHATSAPP_COEXISTENCE_FEATURE,
+                }
+            )
         return {
             "app_id": self.app_id,
             "configuration_id": self.embedded_signup_config_id,
